@@ -121,3 +121,49 @@ SaveScreen {
 #save-buttons > Button {
     margin: 0 1;
 }
+
+ProfilesScreen, ProfileEditorScreen, ProfileDeleteScreen {
+    align: center middle;
+}
+
+#profiles-dialog, #profile-editor, #profile-delete-dialog {
+    width: 76;
+    max-width: 100%;
+    height: auto;
+    max-height: 100%;
+    border: thick solid yellow;
+    background: $boost;
+    padding: 0 1;
+}
+
+#profile-list {
+    height: 1fr;
+    min-height: 3;
+}
+
+#profiles-dialog {
+    height: 20;
+}
+
+#profile-fields {
+    height: 1fr;
+    min-height: 3;
+}
+
+#profile-editor {
+    height: 23;
+}
+
+#profile-error, #profile-notice, #profile-effective {
+    height: auto;
+    max-height: 3;
+}
+
+.profile-buttons {
+    height: 3;
+}
+
+.profile-buttons > Button {
+    min-width: 10;
+    width: 1fr;
+}

@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 _MIN_FREQUENCY_HZ = 1
 _MAX_FREQUENCY_HZ = 2_000_000_000
 _MAX_GAIN_DB = 50
+_MAX_PPM_CORRECTION = 1000
+_PPM_TYPE_ERROR = 'PPM correction must be an integer'
+_PPM_RANGE_ERROR = 'PPM correction must be between -1000 and 1000'
 _STDERR_TAIL_SIZE = 8192
 
 _FREQUENCY_TYPE_ERROR = 'Frequency must be an integer number of Hz'
@@ -42,11 +45,16 @@ class SDRConfig:
     frequency_hz: int
     gain_db: float
     device_index: int = 0
+    ppm_correction: int = 0
 
     def __post_init__(self) -> None:
         frequency_hz = self.frequency_hz
         gain_db = self.gain_db
         device_index = self.device_index
+        if isinstance(self.ppm_correction, bool) or not isinstance(self.ppm_correction, int):
+            raise TypeError(_PPM_TYPE_ERROR)
+        if not -_MAX_PPM_CORRECTION <= self.ppm_correction <= _MAX_PPM_CORRECTION:
+            raise ValueError(_PPM_RANGE_ERROR)
         if isinstance(frequency_hz, bool) or not isinstance(frequency_hz, int):
             raise TypeError(_FREQUENCY_TYPE_ERROR)
         if not _MIN_FREQUENCY_HZ <= frequency_hz <= _MAX_FREQUENCY_HZ:
@@ -70,7 +78,7 @@ class SDRConfig:
 
 def build_rtl_fm_args(config: SDRConfig) -> list[str]:
     """Build rtl_fm arguments for demodulated mono PCM at 22050 Hz."""
-    return [
+    args = [
         '-d',
         str(config.device_index),
         '-f',
@@ -82,6 +90,9 @@ def build_rtl_fm_args(config: SDRConfig) -> list[str]:
         '-M',
         'fm',
     ]
+    if config.ppm_correction:
+        args.extend(['-p', str(config.ppm_correction)])
+    return args
 
 
 class RTLFMReceiver:

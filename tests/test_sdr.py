@@ -6,6 +6,23 @@ import mmng_ui.sdr as sdr_module
 from mmng_ui.sdr import DeviceBusyError, RTLFMReceiver, SDRConfig, SdrError, build_rtl_fm_args
 
 
+def test_ppm_constructor_and_zero_argv_compatibility():
+    config = SDRConfig(123_456_789, 17.5, 2)
+    assert config.ppm_correction == 0
+    assert build_rtl_fm_args(config) == ['-d', '2', '-f', '123456789', '-g', '17.5', '-s', '22050', '-M', 'fm']
+
+
+@pytest.mark.parametrize('ppm', [-1000, -12, 12, 1000])
+def test_ppm_signed_arguments(ppm):
+    assert build_rtl_fm_args(SDRConfig(123_456_789, 12, ppm_correction=ppm))[-2:] == ['-p', str(ppm)]
+
+
+@pytest.mark.parametrize('ppm', [True, False, 1.5, '12', None, -1001, 1001])
+def test_ppm_rejects_invalid_values(ppm):
+    with pytest.raises((TypeError, ValueError), match='PPM'):
+        SDRConfig(123_456_789, 12, ppm_correction=ppm)
+
+
 def test_sdr_config_requires_a_supported_frequency_and_manual_gain():
     assert SDRConfig(frequency_hz=123_456_789, gain_db=17.5).device_index == 0
 

@@ -11,6 +11,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from subprocess import PIPE
+from typing import ClassVar
 
 import click
 from rich.emoji import EMOJI
@@ -20,7 +21,7 @@ from textual import events, work
 from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Center, Container, Horizontal
+from textual.containers import Center, Container, Horizontal, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
@@ -47,6 +48,14 @@ from mmng_ui._version import __version__
 from mmng_ui.capcode_db import CapcodeDB
 from mmng_ui.reader import ParseLine
 from mmng_ui.sdr import RTLFMReceiver, SDRConfig, SdrError
+from mmng_ui.sdr_profiles import (
+    FrequencyProfile,
+    ProfileCatalog,
+    ProfileStoreError,
+    default_profile_path,
+    load_profiles,
+    save_profiles,
+)
 
 
 def parse_ports(port_str: str) -> list[PortConfig]:
@@ -448,6 +457,163 @@ class SaveScreen(ModalScreen):
         self.app.pop_screen()
 
 
+class ProfileEditorScreen(ModalScreen):
+    """Edit draft settings; persistence belongs to the app's guarded handlers."""
+
+    BINDINGS: ClassVar = [('escape', 'cancel', 'Cancel')]
+
+    def __init__(self, profile: FrequencyProfile | None = None) -> None:
+        super().__init__()
+        self.profile = profile
+
+    def compose(self) -> ComposeResult:
+        config = self.profile.config if self.profile else None
+        with Container(id='profile-editor'):
+            yield Label('Edit SDR profile' if self.profile else 'New SDR profile')
+            with VerticalScroll(id='profile-fields'):
+                for field, label, value in (
+                    ('name', 'Profile name', self.profile.name if self.profile else ''),
+                    ('frequency', 'Frequency (Hz)', str(config.frequency_hz) if config else ''),
+                    ('device', 'RTL-SDR device index (no discovery)', str(config.device_index) if config else '0'),
+                    ('gain', 'Gain (dB, 0-50)', str(config.gain_db) if config else ''),
+                    ('ppm', 'PPM correction (-1000 to 1000)', str(config.ppm_correction) if config else '0'),
+                ):
+                    yield Label(label)
+                    yield Input(value=value, id=f'profile-{field}')
+            yield Label('', id='profile-error', markup=False)
+            with Horizontal(classes='profile-buttons'):
+                yield Button('Save', id='profile-save', variant='primary')
+                yield Button('Cancel', id='profile-cancel')
+
+    def on_mount(self) -> None:
+        self.query_one('#profile-error', Label).styles.width = '100%'
+        self.query_one('#profile-name', Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == 'profile-cancel':
+            self.action_cancel()
+        elif event.button.id == 'profile-save':
+            try:
+                values = {
+                    field: self.query_one(f'#profile-{field}', Input).value
+                    for field in ('name', 'frequency', 'device', 'gain', 'ppm')
+                }
+                profile = FrequencyProfile(
+                    values['name'],
+                    SDRConfig(
+                        int(values['frequency']), float(values['gain']), int(values['device']), int(values['ppm'])
+                    ),
+                )
+                if self.app.save_profile(profile, self.profile.name if self.profile else None):
+                    self.dismiss()
+                else:
+                    self.query_one('#profile-error', Label).update(self.app.profile_notice)
+            except (ValueError, TypeError) as exc:
+                self.query_one('#profile-error', Label).update(str(exc))
+
+    def action_cancel(self) -> None:
+        self.dismiss()
+
+
+class ProfileDeleteScreen(ModalScreen):
+    BINDINGS: ClassVar = [('escape', 'cancel', 'Cancel')]
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.profile_name = name
+
+    def compose(self) -> ComposeResult:
+        with Container(id='profile-delete-dialog'):
+            yield Label(f'Delete profile {self.profile_name}?', markup=False)
+            with Horizontal(classes='profile-buttons'):
+                yield Button('Delete', id='profile-confirm-delete', variant='error')
+                yield Button('Cancel', id='profile-cancel')
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == 'profile-cancel' or (
+            event.button.id == 'profile-confirm-delete' and self.app.delete_profile(self.profile_name)
+        ):
+            self.dismiss()
+
+    def action_cancel(self) -> None:
+        self.dismiss()
+
+
+class ProfilesScreen(ModalScreen):
+    BINDINGS: ClassVar = [('escape', 'cancel', 'Close')]
+
+    def compose(self) -> ComposeResult:
+        with Container(id='profiles-dialog'):
+            yield Label('SDR profiles (selection never starts reception)')
+            yield Label('', id='profile-effective', markup=False)
+            yield DataTable(id='profile-list', cursor_type='row')
+            yield Label('', id='profile-notice', markup=False)
+            with Horizontal(classes='profile-buttons'):
+                yield Button('New', id='profile-new')
+                yield Button('Edit', id='profile-edit')
+                yield Button('Select', id='profile-select')
+                yield Button('Delete', id='profile-delete')
+                yield Button('Close', id='profile-close')
+
+    def on_mount(self) -> None:
+        self.query_one(DataTable).add_columns('Name', 'Hz', 'Device', 'Gain dB', 'PPM')
+        self.refresh_profiles()
+        self.query_one(DataTable).focus()
+
+    def refresh_profiles(self) -> None:
+        table = self.query_one(DataTable)
+        row = table.cursor_row
+        table.clear()
+        for profile in self.app.profile_catalog.profiles:
+            config = profile.config
+            table.add_row(
+                Text(profile.name),
+                config.frequency_hz,
+                config.device_index,
+                config.gain_db,
+                config.ppm_correction,
+                key=profile.name,
+            )
+        if table.row_count:
+            table.move_cursor(row=min(row, table.row_count - 1))
+        self.query_one('#profile-effective', Label).update(
+            f'Stored selection: {self.app.profile_catalog.selected_name or "none"}\n'
+            f'Effective configuration: {self.app.profile_source}'
+        )
+        self.query_one('#profile-notice', Label).update(self.app.profile_notice)
+        editable = self.app.profiles_editable
+        self.query_one('#profile-new', Button).disabled = not editable
+        for action in ('edit', 'select', 'delete'):
+            self.query_one(f'#profile-{action}', Button).disabled = not editable or not table.row_count
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        action = event.button.id
+        if action == 'profile-close':
+            self.dismiss()
+            return
+        if not self.app.profiles_editable:
+            return
+        if action == 'profile-new':
+            self.app.push_screen(ProfileEditorScreen())
+            return
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return
+        profile = self.app.profile_catalog.profiles[table.cursor_row]
+        if action == 'profile-edit':
+            self.app.push_screen(ProfileEditorScreen(profile))
+        elif action == 'profile-select':
+            self.app.select_profile(profile.name)
+        elif action == 'profile-delete':
+            self.app.push_screen(ProfileDeleteScreen(profile.name))
+
+    def action_cancel(self) -> None:
+        self.dismiss()
+
+
 class FeedWidget(Widget):
     """A widget representing a single POCSAG feed on one UDP port."""
 
@@ -461,6 +627,7 @@ class FeedWidget(Widget):
         self._sdr_start_worker = None
         self._sdr_stop_worker = None
         self._sdr_unmounting = False
+        self._sdr_replacement_request = None
         self.message_count = []
 
     DEFAULT_CSS = """
@@ -522,6 +689,7 @@ FeedWidget {
                 self._show_sdr_state(state, str(exc))
         finally:
             self._sdr_start_worker = None
+            getattr(self.app, 'refresh_profile_views', lambda: None)()
 
     async def _run_sdr_stop(self) -> None:
         try:
@@ -531,9 +699,12 @@ FeedWidget {
                 self._show_sdr_state('cleanup_failed', str(exc))
         finally:
             self._sdr_stop_worker = None
+            getattr(self.app, 'refresh_profile_views', lambda: None)()
 
     async def start_sdr(self) -> None:
         """Start configured RTL-SDR acquisition only after explicit TUI input."""
+        if self.app.is_web or self._sdr_unmounting:
+            return
         config = getattr(self.app, 'sdr_config', None)
         if config is None:
             return
@@ -547,19 +718,38 @@ FeedWidget {
         if sink is None:
             self._show_sdr_state('error', 'multimon-ng input is unavailable')
             return
-        if self.sdr_session is None:
-            self.sdr_session = RTLFMReceiver(config, sink, on_state=self._show_sdr_state)
         try:
+            if self.sdr_session is not None and self.sdr_session.config != config:
+                if self.sdr_session.state not in ('stopped', 'error'):
+                    return
+                request = object()
+                self._sdr_replacement_request = request
+                try:
+                    await self.sdr_session.stop()
+                    # Stop/unmount intent must survive the old session's cleanup await.
+                    if self._sdr_replacement_request is not request or self._sdr_unmounting:
+                        return
+                    if self.sdr_session.state not in ('stopped', 'error'):
+                        return
+                    self.sdr_session = None
+                finally:
+                    if self._sdr_replacement_request is request:
+                        self._sdr_replacement_request = None
+            if self.sdr_session is None:
+                self.sdr_session = RTLFMReceiver(config, sink, on_state=self._show_sdr_state)
             await self.sdr_session.start()
         except SdrError as exc:
-            self._show_sdr_state('error', str(exc))
+            state = 'cleanup_failed' if self.sdr_session and self.sdr_session.state == 'cleanup_failed' else 'error'
+            self._show_sdr_state(state, str(exc))
 
     async def stop_sdr(self) -> None:
+        self._sdr_replacement_request = None
         if self.sdr_session is not None:
             await self.sdr_session.stop()
 
     async def on_unmount(self) -> None:
         self._sdr_unmounting = True
+        self._sdr_replacement_request = None
         if self.sdr_session is not None:
             try:
                 await self.sdr_session.stop()
@@ -578,6 +768,7 @@ FeedWidget {
         stop = self.query_one(f'#sdr-stop-{self.port}', Button)
         start.disabled = active or getattr(self.app, 'sdr_config', None) is None
         stop.disabled = not active
+        getattr(self.app, 'refresh_profile_views', lambda: None)()
 
     async def on_mount(self) -> None:
         """Setup the initial UI components."""
@@ -766,6 +957,11 @@ class Pocsag(App):
         self.sox_rate = sox_rate
         self.capcode_db = capcode_db
         self.sdr_config = sdr_config
+        self.profile_catalog = ProfileCatalog()
+        self.profile_source = 'CLI' if sdr_config is not None else 'none'
+        self.profile_notice = ''
+        self._profile_path = None
+        self._profile_error = False
         self.mmng = Executable(command=mmng_binary, resolved_path=shutil.which(mmng_binary), version=None)
         if self.sox_binary and self.sox_rate:
             self.sox = Executable(command=sox_binary, resolved_path=shutil.which(sox_binary) or None, version=None)
@@ -797,10 +993,138 @@ class Pocsag(App):
         ),
         Binding(key='r', action='rename_tab', description='Rename tab'),
         Binding(key='s', action='save_as', description='Save tab to file'),
+        Binding(key='p', action='sdr_profiles', description='SDR profiles'),
     ]
 
     def on_mount(self):
+        # is_web is reliable only after Textual has installed the active driver.
+        if self.profiles_local:
+            self._profile_path = default_profile_path()
+            try:
+                self.profile_catalog = load_profiles(self._profile_path)
+                if self.sdr_config is None:
+                    self._apply_profile_selection()
+            except ProfileStoreError as exc:
+                self._profile_error = True
+                self.profile_notice = str(exc)
+        else:
+            self.sdr_config = None
+            self.profile_source = 'unavailable in web mode'
         self.push_screen(MainScreen())
+
+    @property
+    def profiles_local(self) -> bool:
+        return self._driver is not None and not self.is_web
+
+    def profile_feeds(self) -> list[FeedWidget]:
+        return [feed for screen in self.screen_stack for feed in screen.query(FeedWidget)]
+
+    @property
+    def profiles_editable(self) -> bool:
+        if not self.profiles_local or self._profile_error or self._profile_path is None:
+            return False
+        for feed in self.profile_feeds():
+            if feed._sdr_replacement_request is not None:  # noqa: SLF001
+                return False
+            if feed.sdr_session is not None and feed.sdr_session.state in (
+                'starting',
+                'running',
+                'stopping',
+                'cleanup_failed',
+            ):
+                return False
+            for worker in (feed._sdr_start_worker, feed._sdr_stop_worker):  # noqa: SLF001
+                if worker is not None and not worker.is_finished:
+                    return False
+        return True
+
+    def refresh_profile_views(self) -> None:
+        for screen in self.screen_stack:
+            if isinstance(screen, ProfilesScreen) and screen.is_mounted:
+                screen.refresh_profiles()
+
+    def _apply_profile_selection(self) -> None:
+        selected = self.profile_catalog.selected
+        self.sdr_config = selected.config if selected else None
+        self.profile_source = f'Profile: {selected.name}' if selected else 'none'
+        for feed in self.profile_feeds():
+            state = feed.sdr_session.state if feed.sdr_session else 'stopped'
+            feed.query_one(f'#sdr-start-{feed.port}', Button).disabled = (
+                state in ('starting', 'running', 'stopping', 'cleanup_failed') or self.sdr_config is None
+            )
+
+    def _commit_profiles(self, catalog: ProfileCatalog, *, apply_selection: bool) -> bool:
+        if not self.profiles_editable:
+            self.profile_notice = 'Profiles are unavailable or SDR cleanup is still pending'
+            return False
+        try:
+            save_profiles(self._profile_path, catalog)
+        except ProfileStoreError as exc:
+            self.profile_notice = str(exc)
+            if not exc.committed:
+                self.refresh_profile_views()
+                return False
+            try:
+                catalog = load_profiles(self._profile_path)
+            except ProfileStoreError as load_error:
+                self._profile_error = True
+                self.sdr_config = None
+                self.profile_source = 'unavailable: committed storage cannot be read'
+                self.profile_notice = f'{exc}; {load_error}'
+                self.refresh_profile_views()
+                return False
+        else:
+            self.profile_notice = 'Profiles saved'
+        self.profile_catalog = catalog
+        if apply_selection:
+            self._apply_profile_selection()
+        self.refresh_profile_views()
+        return True
+
+    def save_profile(self, profile: FrequencyProfile, original_name: str | None = None) -> bool:
+        if not self.profiles_editable:
+            return False
+        profiles = list(self.profile_catalog.profiles)
+        selected = self.profile_catalog.selected_name
+        if original_name is None:
+            profiles.append(profile)
+        else:
+            index = next((i for i, item in enumerate(profiles) if item.name == original_name), None)
+            if index is None:
+                return False
+            profiles[index] = profile
+            if selected == original_name:
+                selected = profile.name
+        try:
+            catalog = ProfileCatalog(tuple(profiles), selected)
+        except (ValueError, TypeError) as exc:
+            self.profile_notice = str(exc)
+            return False
+        return self._commit_profiles(
+            catalog, apply_selection=original_name is not None and (original_name == self.profile_catalog.selected_name)
+        )
+
+    def select_profile(self, name: str) -> bool:
+        if not self.profiles_editable or not any(p.name == name for p in self.profile_catalog.profiles):
+            return False
+        return self._commit_profiles(ProfileCatalog(self.profile_catalog.profiles, name), apply_selection=True)
+
+    def delete_profile(self, name: str) -> bool:
+        if not self.profiles_editable or not any(p.name == name for p in self.profile_catalog.profiles):
+            return False
+        selected = self.profile_catalog.selected_name
+        profiles = tuple(p for p in self.profile_catalog.profiles if p.name != name)
+        catalog = ProfileCatalog(profiles, None if selected == name else selected)
+        return self._commit_profiles(catalog, apply_selection=selected == name)
+
+    def check_action(self, action: str, _parameters: tuple[object, ...]) -> bool | None:
+        if action == 'sdr_profiles':
+            return self.profiles_local
+        return True
+
+    def action_sdr_profiles(self) -> None:
+        if self.profiles_local and isinstance(self.screen, MainScreen):
+            self.push_screen(ProfilesScreen())
 
     def action_clear_screen(self) -> None:
         tabs = self.screen.query_one(FeedTabbedContent)

@@ -20,6 +20,7 @@ You can also use it within a web browser!
     * [Normal TUI (text console) mode](#normal-tui-text-console-mode)
     * [Web mode](#web-mode)
   * [How to use it](#how-to-use-it)
+    * [SDR frequency profiles](#sdr-frequency-profiles)
     * [JSON detection](#json-detection)
     * [sox conversion mode](#sox-conversion-mode)
     * [Multiple ports and tabs](#multiple-ports-and-tabs)
@@ -106,6 +107,52 @@ Underneath the log window in another sparkline, and this shows messages per seco
 The footer shows available keyboard choices to quit the app, show a help screen, and clear all logging panes.
 
 The mouse will also work!
+
+### SDR frequency profiles
+
+In the local console, press `p` to manage named SDR profiles. Use New, Edit,
+Select, Delete (with confirmation), and Close; Tab/Shift+Tab and Enter operate
+all controls, and Escape cancels the current dialog. The editor scrolls in an
+80x24 terminal. Selecting or restoring a profile never starts reception: use
+**Start SDR** separately, and **Stop SDR** before changing profiles.
+
+Profiles contain frequency in integer Hz (1-2000000000), a nonnegative RTL-SDR
+device index, manual gain in dB (0-50), and integer PPM correction (-1000 to
+1000). Device indices are entered manually; no devices are scanned or discovered.
+A nonzero PPM correction is passed to `rtl_fm` with `-p`.
+
+Names are trimmed, contain 1-64 characters without controls, and must be unique
+without regard to case. Different names may share the same tuning settings.
+Creating a profile does not select it. Editing the selected profile updates the
+pending configuration after persistence; deleting it clears that configuration.
+Profile mutations and selection are blocked while any feed has active reception,
+pending lifecycle work, or unresolved cleanup. Stop remains available for cleanup
+retry. A different configuration is used only on the next explicit Start.
+
+Explicit `--sdr-frequency-hz` and `--sdr-gain-db` settings, with the existing
+optional `--sdr-device-index`, take precedence at launch and are never saved
+automatically. Otherwise the saved selection is restored. The profile dialog
+shows the stored selection separately from the effective CLI/profile source.
+An explicit later Select overrides the CLI configuration for that session.
+
+Profiles are stored at `$XDG_CONFIG_HOME/mmng-ui/sdr-profiles.json`, falling back
+to `~/.config/mmng-ui/sdr-profiles.json` when XDG_CONFIG_HOME is unset, empty,
+or relative. The versioned JSON contains only profile names, tuning settings and
+the selected name; decoded messages and audio are never included. New application
+directories use mode 0700 and profile files use mode 0600. Saves use a synced
+same-directory temporary file and atomic replacement. A failure before replacement
+preserves the previous file. A directory-sync failure after replacement is shown
+as uncertain durability, and the displayed catalog is reconciled with the file.
+Malformed or unsupported storage is preserved and profile writes are disabled;
+repair it outside the app and restart. Symlink and nonregular profile files are
+rejected. Use one writer: concurrent instances can overwrite each other's saves.
+Configuration ancestor directories must be trusted and not attacker-controlled;
+destination checks do not protect against ancestor replacement or redirection.
+
+Profile management and restoration are unavailable in web mode, as determined by
+Textual's active runtime driver. Web clients cannot use restored profiles to start
+SDR reception. Existing UDP decoding remains available. RTL-SDR hardware and
+uConsole acceptance are still pending.
 
 ### JSON detection
 

@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.drivers.headless_driver import HeadlessDriver
 from textual.message import Message
 from textual.widgets import (
+    Button,
     DataTable,
     Digits,
     Footer,
@@ -32,6 +34,7 @@ from mmng_ui.pocsag import (
     MainScreen,
     MsgsPerSecond,
     OutputMessage,
+    Pocsag,
     PortConfig,
     RenameTabScreen,
     SaveScreen,
@@ -45,7 +48,15 @@ from mmng_ui.pocsag import (
     _serve_mode,
     parse_ports,
 )
-from mmng_ui.sdr import DeviceBusyError, RTLFMReceiver, SDRConfig
+from mmng_ui.sdr import DeviceBusyError, RTLFMReceiver, SDRConfig, SdrError
+from mmng_ui.sdr_profiles import (
+    FrequencyProfile,
+    ProfileCatalog,
+    ProfileStoreError,
+    default_profile_path,
+    load_profiles,
+    save_profiles,
+)
 
 
 class StatusApp(App):
@@ -2293,3 +2304,780 @@ async def test_save_screen_notifies_after_save():
         assert title == 'Export'
         assert msg.startswith('Saved as')
         assert 'mmng_port8888_' in msg
+
+
+@pytest.fixture
+def profile_app(tmp_path, monkeypatch):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    # Disable only the button debounce animation; keyboard events still run normally.
+    monkeypatch.setattr(Button, '_start_active_affect', lambda _button: None)
+
+    async def detect(_screen):
+        return '1.4.0', True
+
+    async def forbidden_spawn(*_args, **_kwargs):
+        pytest.fail('Profile management spawned a subprocess')
+
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', lambda _feed: None)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', forbidden_spawn)
+
+    def make(config=None, ports=(8888,)):
+        return Pocsag('multimon-ng', [PortConfig(port) for port in ports], 'US', None, None, sdr_config=config)
+
+    return make
+
+
+def seed_profiles():
+    a = FrequencyProfile('Alpha', SDRConfig(123456789, 12, 0, -12))
+    b = FrequencyProfile('Beta', SDRConfig(123456790, 13, 1, 10))
+    catalog = ProfileCatalog((a, b), a.name)
+    save_profiles(default_profile_path(), catalog)
+    return catalog
+
+
+async def fill_profile_editor(pilot, name='Alpha', frequency='123456789', device='0', gain='12', ppm='-12'):
+    for field, value in [('name', name), ('frequency', frequency), ('device', device), ('gain', gain), ('ppm', ppm)]:
+        pilot.app.screen.query_one(f'#profile-{field}', Input).value = value
+    button = pilot.app.screen.query_one('#profile-save')
+    button.focus()
+    await pilot.press('enter')
+    await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_profile_crud_keyboard_production_css_80x24(profile_app):
+    app = profile_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press('p')
+        await pilot.pause()
+        new = app.screen.query_one('#profile-new')
+        assert app.screen.region.contains_region(new.region)
+        new.focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        await fill_profile_editor(pilot, frequency='invalid')
+        assert app.screen.query_one('#profile-frequency', Input).value == 'invalid'
+        assert not default_profile_path().exists()
+        await fill_profile_editor(pilot)
+        assert app.sdr_config is None
+        assert load_profiles(default_profile_path()).selected_name is None
+        app.screen.query_one('#profile-select').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        assert app.sdr_config.ppm_correction == -12
+        app.screen.query_one('#profile-edit').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        await fill_profile_editor(pilot, name='Renamed', ppm='25')
+        assert app.sdr_config.ppm_correction == 25
+        assert app.profile_catalog.selected_name == 'Renamed'
+        app.screen.query_one('#profile-new').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        await fill_profile_editor(pilot, name='RENAMED')
+        assert app.screen.query_one('#profile-name', Input).value == 'RENAMED'
+        await pilot.press('escape')
+        await pilot.pause()
+        app.screen.query_one('#profile-delete').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        await pilot.press('escape')
+        await pilot.pause()
+        assert len(app.profile_catalog.profiles) == 1
+        app.screen.query_one('#profile-delete').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        app.screen.query_one('#profile-confirm-delete').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        assert app.sdr_config is None
+        assert load_profiles(default_profile_path()) == ProfileCatalog()
+        await pilot.press('escape')
+        await pilot.pause()
+        assert app.screen.query_one('#sdr-start-8888').disabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cli', [False, True])
+async def test_profile_restore_cli_precedence_and_explicit_selection(profile_app, cli):
+    catalog = seed_profiles()
+    path = default_profile_path()
+    original = path.read_bytes()
+    config = SDRConfig(222222222, 20) if cli else None
+    app = profile_app(config)
+    assert app.sdr_config == config
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert app.sdr_config == (config if cli else catalog.selected.config)
+        assert path.read_bytes() == original
+        await pilot.press('p')
+        await pilot.pause()
+        effective = str(app.screen.query_one('#profile-effective').render())
+        assert ('CLI' if cli else 'Alpha') in effective
+        assert app.select_profile('Beta')
+        assert app.sdr_config == catalog.profiles[1].config
+        assert app.profile_source == 'Profile: Beta'
+
+
+@pytest.mark.asyncio
+async def test_profile_web_boundary_uses_active_driver_and_never_loads_store(profile_app, monkeypatch):
+    seed_profiles()
+    monkeypatch.setattr(HeadlessDriver, 'is_web', property(lambda _driver: True))
+
+    def forbidden_load(_path):
+        pytest.fail('Web mode accessed the profile store')
+
+    monkeypatch.setattr(pocsag_module, 'load_profiles', forbidden_load)
+    app = profile_app(SDRConfig(123456789, 12))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.sdr_config is None
+        await pilot.press('p')
+        await pilot.pause()
+        assert isinstance(app.screen, MainScreen)
+        assert not app.select_profile('Alpha')
+        assert not app.delete_profile('Alpha')
+        assert not app.save_profile(seed_profile_for_handler())
+        feed = app.screen.query_one(FeedWidget)
+        await feed.start_sdr()
+        assert feed.sdr_session is None
+
+
+def seed_profile_for_handler():
+    return FrequencyProfile('Gamma', SDRConfig(123456789, 12))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('busy', ['starting', 'running', 'stopping', 'cleanup_failed', 'start_worker', 'stop_worker'])
+async def test_profile_handlers_reject_any_busy_feed(profile_app, busy):
+    seed_profiles()
+    app = profile_app(ports=(8888, 8889))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        feeds = list(app.screen.query(FeedWidget))
+        feed = feeds[1]
+        original = app.profile_catalog
+        original_config = app.sdr_config
+        if busy.endswith('worker'):
+            setattr(feed, f'_sdr_{busy}', SimpleNamespace(is_finished=False))
+        else:
+            feed.sdr_session = SimpleNamespace(state=busy)
+        assert not app.select_profile('Beta')
+        assert not app.delete_profile('Alpha')
+        assert not app.save_profile(seed_profile_for_handler())
+        assert app.profile_catalog == original
+        assert app.sdr_config == original_config
+        feed.sdr_session = None
+        feed._sdr_start_worker = None  # noqa: SLF001
+        feed._sdr_stop_worker = None  # noqa: SLF001
+        assert app.select_profile('Beta')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('committed', [False, True])
+async def test_profile_ui_reconciles_save_failure(profile_app, monkeypatch, committed):
+    catalog = seed_profiles()
+    app = profile_app()
+    save = pocsag_module.save_profiles
+
+    def failing_save(path, updated):
+        if committed:
+            save(path, updated)
+        raise ProfileStoreError('durability uncertain' if committed else 'cannot save', committed=committed)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(pocsag_module, 'save_profiles', failing_save)
+        assert app.select_profile('Beta') is committed
+        expected = catalog.profiles[1].config if committed else catalog.selected.config
+        assert app.sdr_config == expected
+        assert app.profile_catalog == load_profiles(default_profile_path())
+
+
+@pytest.mark.asyncio
+async def test_profile_malformed_storage_does_not_break_cli_or_overwrite(profile_app):
+    path = default_profile_path()
+    path.parent.mkdir(parents=True)
+    path.write_text('{broken')
+    cli = SDRConfig(123456789, 12)
+    app = profile_app(cli)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.sdr_config == cli
+        assert not app.save_profile(seed_profile_for_handler())
+        assert path.read_text() == '{broken'
+
+
+@pytest.mark.asyncio
+async def test_profile_changed_configuration_cleans_terminal_receiver_before_replacement(profile_app, monkeypatch):
+    seed_profiles()
+    app = profile_app()
+    cleaned = asyncio.Event()
+    release = asyncio.Event()
+    constructed = []
+
+    class OldReceiver:
+        state = 'stopped'
+        config = SDRConfig(1, 0)
+
+        async def stop(self):
+            cleaned.set()
+            await release.wait()
+
+    class NewReceiver:
+        def __init__(self, config, _sink, on_state):
+            assert release.is_set()
+            self.config = config
+            self.on_state = on_state
+            self.state = 'stopped'
+            constructed.append(config)
+
+        async def start(self):
+            self.state = 'running'
+
+        async def stop(self):
+            self.state = 'stopped'
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        feed = app.screen.query_one(FeedWidget)
+        feed.process = SimpleNamespace(stdin=object())
+        old = OldReceiver()
+        feed.sdr_session = old
+        assert app.select_profile('Beta')
+        monkeypatch.setattr(pocsag_module, 'RTLFMReceiver', NewReceiver)
+        starting = asyncio.create_task(feed.start_sdr())
+        try:
+            await asyncio.wait_for(cleaned.wait(), timeout=1)
+            assert not constructed
+            assert feed.sdr_session is old
+            release.set()
+            await asyncio.wait_for(starting, timeout=1)
+            assert constructed == [app.sdr_config]
+        finally:
+            release.set()
+            await starting
+
+
+@pytest.mark.asyncio
+async def test_profile_switch_after_real_receiver_stop_preserves_udp_and_device_ownership(profile_app, monkeypatch):
+    catalog = seed_profiles()
+    app = profile_app()
+    processes = []
+    writes = []
+
+    class Process:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+
+        async def wait(self):
+            await self.exited.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+        kill = terminate
+
+    class Sink:
+        def write(self, data):
+            writes.append(data)
+
+        def drain(self):
+            pass
+
+    async def spawn(*args, **_kwargs):
+        processes.append((args, Process()))
+        return processes[-1][1]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        feed = app.screen.query_one(FeedWidget)
+        feed.process = SimpleNamespace(stdin=Sink())
+        monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+        handler = UDPHandler(feed, SimpleNamespace(time=lambda: 10), 8888)
+        handler.datagram_received(b'udp-before', ('192.0.2.1', 8888))
+        await pilot.click('#sdr-start-8888')
+        await pilot.pause()
+        first = feed.sdr_session
+        assert first.state == 'running'
+        assert not app.select_profile('Beta')
+        competitor = RTLFMReceiver(catalog.selected.config, Sink())
+        with pytest.raises(DeviceBusyError):
+            await competitor.start()
+        handler.datagram_received(b'excluded', ('192.0.2.1', 8888))
+        await pilot.click('#sdr-stop-8888')
+        await pilot.pause()
+        assert first.state == 'stopped'
+        assert app.select_profile('Beta')
+        assert len(processes) == 1
+        handler.datagram_received(b'udp-restored', ('192.0.2.1', 8888))
+        assert writes == [b'udp-before', b'udp-restored']
+        await pilot.click('#sdr-start-8888')
+        await pilot.pause()
+        assert feed.sdr_session is not first
+        assert feed.sdr_session.config == catalog.profiles[1].config
+        assert processes[1][0][-2:] == ('-p', '10')
+        await feed.stop_sdr()
+        await competitor.start()
+        await competitor.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unresolved', [False, True])
+async def test_profile_replacement_of_terminal_error_is_fenced(profile_app, monkeypatch, unresolved):
+    seed_profiles()
+    app = profile_app()
+    created = []
+
+    class TerminalReceiver:
+        config = SDRConfig(1, 0)
+        state = 'error'
+
+        async def stop(self):
+            if unresolved:
+                self.state = 'cleanup_failed'
+                message = 'cleanup unresolved'
+                raise SdrError(message)
+
+    class Replacement:
+        def __init__(self, config, _sink, on_state):
+            self.config = config
+            self.on_state = on_state
+            self.state = 'stopped'
+            created.append(config)
+
+        async def start(self):
+            self.state = 'running'
+
+        async def stop(self):
+            self.state = 'stopped'
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        feed = app.screen.query_one(FeedWidget)
+        old = TerminalReceiver()
+        feed.sdr_session = old
+        feed.process = SimpleNamespace(stdin=object())
+        monkeypatch.setattr(pocsag_module, 'RTLFMReceiver', Replacement)
+        await feed.start_sdr()
+        assert bool(created) is not unresolved
+        if unresolved:
+            assert feed.sdr_session is old
+            assert not app.select_profile('Beta')
+            assert app.screen.query_one('#sdr-start-8888').disabled
+            assert not app.screen.query_one('#sdr-stop-8888').disabled
+            feed.sdr_session = None
+
+
+@pytest.mark.asyncio
+async def test_profile_edit_rename_collision_and_failed_selected_edit_preserve_config(profile_app, monkeypatch):
+    seed_profiles()
+    app = profile_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press('p')
+        await pilot.pause()
+        original = app.profile_catalog
+        config = app.sdr_config
+        app.screen.query_one('#profile-edit').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        ppm_input = app.screen.query_one('#profile-ppm', Input)
+        ppm_input.focus()
+        await pilot.pause()
+        assert app.screen.region.contains_region(ppm_input.region)
+        await fill_profile_editor(pilot, name='BETA')
+        assert app.profile_catalog == original
+        assert app.sdr_config == config
+
+        def fail_save(_path, _catalog):
+            message = 'injected save failure'
+            raise ProfileStoreError(message)
+
+        monkeypatch.setattr(pocsag_module, 'save_profiles', fail_save)
+        await fill_profile_editor(pilot, name='Alpha', ppm='35')
+        assert app.screen.query_one('#profile-ppm', Input).value == '35'
+        assert app.profile_catalog == original
+        assert app.sdr_config == config
+        await pilot.press('escape')
+        await pilot.pause()
+        assert app.profile_catalog == load_profiles(default_profile_path())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shutdown', [False, True])
+async def test_profile_stop_or_unmount_during_replacement_cleanup_prevents_new_receiver(
+    profile_app, monkeypatch, shutdown
+):
+    seed_profiles()
+    app = profile_app()
+    entered = asyncio.Event()
+    second_stop = asyncio.Event()
+    release = asyncio.Event()
+    constructions = []
+    stop_calls = []
+
+    class OldReceiver:
+        config = SDRConfig(1, 0)
+        state = 'error'
+
+        async def stop(self):
+            stop_calls.append(None)
+            self.state = 'stopping'
+            entered.set()
+            if len(stop_calls) == 2:
+                second_stop.set()
+            await release.wait()
+            self.state = 'stopped'
+
+    class Replacement:
+        def __init__(self, config, _sink, on_state):
+            self.config = config
+            self.on_state = on_state
+            self.state = 'stopped'
+            constructions.append(config)
+
+        async def start(self):
+            self.state = 'running'
+
+        async def stop(self):
+            self.state = 'stopped'
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        feed = app.screen.query_one(FeedWidget)
+        old = OldReceiver()
+        feed.sdr_session = old
+        feed.process = SimpleNamespace(stdin=object())
+        monkeypatch.setattr(pocsag_module, 'RTLFMReceiver', Replacement)
+        starting = asyncio.create_task(feed.start_sdr())
+        stopping = None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            stopping = asyncio.create_task(feed.on_unmount() if shutdown else feed.stop_sdr())
+            await asyncio.wait_for(second_stop.wait(), timeout=1)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(starting, stopping), timeout=1)
+            assert constructions == []
+            assert feed.sdr_session is old
+            assert old.state == 'stopped'
+        finally:
+            release.set()
+            await asyncio.gather(starting, *([stopping] if stopping is not None else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_profile_form_cleanup_failure_keeps_dialog_responsive(profile_app, monkeypatch):
+    seed_profiles()
+    app = profile_app()
+    path = default_profile_path()
+    original = path.read_bytes()
+    original_unlink = Path.unlink
+    retained = []
+
+    def fail_replace(*_args, **_kwargs):
+        message = 'injected form replace failure'
+        raise OSError(message)
+
+    def fail_unlink(temporary, *args, **kwargs):
+        if temporary.parent == path.parent and temporary.name.startswith('.sdr-profiles-'):
+            retained.append(temporary)
+            message = 'injected form unlink failure'
+            raise OSError(message)
+        return original_unlink(temporary, *args, **kwargs)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press('p')
+        await pilot.pause()
+        app.screen.query_one('#profile-edit').focus()
+        await pilot.press('enter')
+        await pilot.pause()
+        original_catalog = app.profile_catalog
+        original_config = app.sdr_config
+        monkeypatch.setattr('mmng_ui.sdr_profiles.os.replace', fail_replace)
+        monkeypatch.setattr(Path, 'unlink', fail_unlink)
+        await fill_profile_editor(pilot, name='Alpha', ppm='35')
+        error_label = app.screen.query_one('#profile-error')
+        error = str(error_label.render())
+        assert error_label.region.height > 0
+        assert app.screen.region.contains_region(error_label.region)
+        visible_error = ' '.join(
+            ' '.join(error_label.render_line(y).text for y in range(error_label.size.height)).split()
+        )
+        assert 'injected form replace failure' in visible_error
+        assert 'injected form unlink failure' in visible_error
+        assert 'retained temporary file:' in visible_error
+        assert 'injected form replace failure' in error
+        assert 'injected form unlink failure' in error
+        assert 'retained' in error.lower()
+        assert len(retained) == 1
+        assert retained[0].exists()
+        assert str(retained[0]) in error
+        assert app.profile_catalog == original_catalog
+        assert app.sdr_config == original_config
+        assert path.read_bytes() == original
+        assert app.screen.query_one('#profile-ppm', Input).value == '35'
+        assert 'Profiles saved' not in app.profile_notice
+        await pilot.press('tab')
+        await pilot.pause()
+        assert app.screen.focused is not None
+        await pilot.click('#profile-cancel')
+        await pilot.pause()
+        assert app.screen.query_one('#profile-close')
+        await pilot.click('#profile-close')
+        await pilot.pause()
+        assert isinstance(app.screen, MainScreen)
+        assert app.profile_catalog == original_catalog
+        assert path.read_bytes() == original
+
+
+class ProfileLifecycleProcess:
+    def __init__(self):
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode = None
+        self.exited = asyncio.Event()
+        self.allow_reap = asyncio.Event()
+        self.allow_reap.set()
+        self.reap_started = asyncio.Event()
+        self.termination_requested = asyncio.Event()
+        self.termination_error = False
+        self.reaped = False
+
+    async def wait(self):
+        await self.exited.wait()
+        self.reap_started.set()
+        await self.allow_reap.wait()
+        self.reaped = True
+        return self.returncode
+
+    def terminate(self):
+        self.termination_requested.set()
+        if self.termination_error:
+            message = 'injected termination failure'
+            raise PermissionError(message)
+
+    kill = terminate
+
+    def finish(self, code=-15):
+        if self.returncode is None:
+            self.returncode = code
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_stop_retry_via_buttons_restores_udp(profile_app, monkeypatch):
+    seed_profiles()
+    app = profile_app()
+    child = ProfileLifecycleProcess()
+    writes = []
+    failed = asyncio.Event()
+    stopped = asyncio.Event()
+    original_show = FeedWidget._show_sdr_state  # noqa: SLF001
+
+    async def spawn(*_args, **_kwargs):
+        return child
+
+    def show_state(feed, state, error):
+        original_show(feed, state, error)
+        if state == 'cleanup_failed':
+            failed.set()
+        elif state == 'stopped':
+            stopped.set()
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    monkeypatch.setattr(FeedWidget, '_show_sdr_state', show_state)
+    async with app.run_test(size=(80, 24)) as pilot:
+        feed = app.screen.query_one(FeedWidget)
+        feed.process = SimpleNamespace(stdin=SimpleNamespace(write=writes.append, drain=lambda: None))
+        handler = UDPHandler(feed, SimpleNamespace(time=lambda: 10), 8888)
+        config = app.sdr_config
+        try:
+            assert await pilot.click('#sdr-start-8888')
+            receiver = feed.sdr_session
+            assert receiver.state == 'running'
+            child.termination_error = True
+            assert await pilot.click('#sdr-stop-8888')
+            await asyncio.wait_for(failed.wait(), timeout=1)
+            assert receiver.state == 'cleanup_failed'
+            assert app.screen.query_one('#sdr-start-8888').disabled
+            assert not app.screen.query_one('#sdr-stop-8888').disabled
+            assert receiver._device_owners[0] is receiver  # noqa: SLF001
+            handler.datagram_received(b'failed-cleanup', ('192.0.2.1', 8888))
+            assert writes == []
+            child.termination_requested.clear()
+            child.termination_error = False
+            assert await pilot.click('#sdr-stop-8888')
+            await asyncio.wait_for(child.termination_requested.wait(), timeout=1)
+            worker = feed._sdr_stop_worker  # noqa: SLF001
+            assert worker is not None
+            assert receiver.state == 'stopping'
+            assert receiver._device_owners[0] is receiver  # noqa: SLF001
+            handler.datagram_received(b'awaiting-reap', ('192.0.2.1', 8888))
+            assert writes == []
+            child.finish()
+            await asyncio.wait_for(stopped.wait(), timeout=1)
+            await asyncio.wait_for(worker.wait(), timeout=1)
+            assert worker.error is None
+            assert receiver.state == 'stopped'
+            assert child.reaped
+            assert 0 not in receiver._device_owners  # noqa: SLF001
+            assert app.sdr_config == config
+            assert not app.screen.query_one('#sdr-start-8888').disabled
+            assert app.screen.query_one('#sdr-stop-8888').disabled
+            handler.datagram_received(b'restored', ('192.0.2.1', 8888))
+            assert writes == [b'restored']
+        finally:
+            child.termination_error = False
+            child.finish()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['stop', 'unmount', 'stop_then_unmount'])
+@pytest.mark.parametrize('cleanup_fails', [False, True])
+async def test_profile_replacement_stop_and_real_unmount_events(profile_app, monkeypatch, action, cleanup_fails):
+    seed_profiles()
+    app = profile_app()
+    child = ProfileLifecycleProcess()
+    spawned = []
+    terminal_error = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    stop_processed = asyncio.Event()
+    unmount_entered = asyncio.Event()
+    old = None
+    gate_cleanup = False
+    fail_cleanup = cleanup_fails
+    original_show = FeedWidget._show_sdr_state  # noqa: SLF001
+    original_terminate = RTLFMReceiver._terminate_process  # noqa: SLF001
+    original_stop_worker = FeedWidget._run_sdr_stop  # noqa: SLF001
+    original_unmount = FeedWidget.on_unmount
+
+    async def spawn(*args, **_kwargs):
+        spawned.append(args)
+        assert len(spawned) == 1, 'Replacement must not start after Stop or unmount'
+        return child
+
+    def show_state(feed, state, error):
+        original_show(feed, state, error)
+        if state == 'error':
+            terminal_error.set()
+
+    async def terminate(receiver):
+        if receiver is old and gate_cleanup:
+            cleanup_entered.set()
+            await release_cleanup.wait()
+            if fail_cleanup:
+                message = 'injected replacement cleanup failure'
+                raise PermissionError(message)
+        await original_terminate(receiver)
+
+    async def stop_worker(feed):
+        stop_processed.set()
+        await original_stop_worker(feed)
+
+    async def unmount(feed):
+        unmount_entered.set()
+        await original_unmount(feed)
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    monkeypatch.setattr(FeedWidget, '_show_sdr_state', show_state)
+    monkeypatch.setattr(FeedWidget, '_run_sdr_stop', stop_worker)
+    monkeypatch.setattr(FeedWidget, 'on_unmount', unmount)
+    monkeypatch.setattr(RTLFMReceiver, '_terminate_process', terminate)
+    start_click = stop_click = removal = None
+    async with app.run_test(size=(80, 24)) as pilot:
+        feed = app.screen.query_one(FeedWidget)
+        feed.process = SimpleNamespace(stdin=SimpleNamespace(write=lambda _data: None, drain=lambda: None))
+        try:
+            assert await pilot.click('#sdr-start-8888')
+            old = feed.sdr_session
+            assert old.state == 'running'
+            assert old._device_owners[0] is old  # noqa: SLF001
+            child.allow_reap.clear()
+            child.finish(code=1)
+            await asyncio.wait_for(child.reap_started.wait(), timeout=1)
+            assert old._device_owners[0] is old  # noqa: SLF001
+            assert not app.profiles_editable
+            assert not child.reaped
+            child.allow_reap.set()
+            await asyncio.wait_for(terminal_error.wait(), timeout=1)
+            assert child.reaped
+            assert 0 not in old._device_owners  # noqa: SLF001
+            await pilot.press('p')
+            await pilot.pause()
+            app.screen.query_one('#profile-list').focus()
+            await pilot.press('down')
+            assert await pilot.click('#profile-select')
+            assert app.profile_catalog.selected_name == 'Beta'
+            assert await pilot.click('#profile-close')
+            config = app.sdr_config
+            assert config != old.config
+            gate_cleanup = True
+            start_click = asyncio.create_task(pilot.click('#sdr-start-8888'))
+            await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+            start_worker = feed._sdr_start_worker  # noqa: SLF001
+            assert start_worker is not None
+            assert old.state == 'stopping'
+            assert feed.sdr_session is old
+            assert len(spawned) == 1
+            assert not app.profiles_editable
+            stop_handle = None
+            if action != 'unmount':
+                stop_click = asyncio.create_task(pilot.click('#sdr-stop-8888'))
+                await asyncio.wait_for(stop_processed.wait(), timeout=1)
+                stop_handle = feed._sdr_stop_worker  # noqa: SLF001
+                assert stop_handle is not None
+                assert feed._sdr_replacement_request is None  # noqa: SLF001
+            if action != 'stop':
+                removal = asyncio.ensure_future(feed.remove())
+                await asyncio.wait_for(unmount_entered.wait(), timeout=1)
+                assert not removal.done()
+                assert feed._sdr_replacement_request is None  # noqa: SLF001
+            release_cleanup.set()
+            await asyncio.wait_for(start_worker.wait(), timeout=1)
+            if stop_handle is not None:
+                await asyncio.wait_for(stop_handle.wait(), timeout=1)
+                assert stop_handle.error is None
+            await asyncio.wait_for(
+                asyncio.gather(*(task for task in (start_click, stop_click) if task is not None)), timeout=1
+            )
+            if removal is not None:
+                await asyncio.wait_for(removal, timeout=1)
+                assert not feed.is_attached
+                assert feed not in app.screen.query(FeedWidget)
+            assert start_worker.error is None
+            assert feed.sdr_session is old
+            assert feed._sdr_replacement_request is None  # noqa: SLF001
+            assert app.sdr_config == config
+            assert len(spawned) == 1
+            if cleanup_fails:
+                assert old.state == 'cleanup_failed'
+                assert 'injected replacement cleanup failure' in old.error
+                if action == 'stop':
+                    assert 'injected replacement cleanup failure' in app.screen.query_one('#sdr-state-8888').content
+                    assert app.screen.query_one('#sdr-start-8888').disabled
+                    assert not app.screen.query_one('#sdr-stop-8888').disabled
+            else:
+                assert old.state == 'stopped'
+            assert 0 not in old._device_owners  # noqa: SLF001
+        finally:
+            fail_cleanup = False
+            release_cleanup.set()
+            child.allow_reap.set()
+            child.finish()
+            await asyncio.gather(
+                *(task for task in (start_click, stop_click, removal) if task is not None), return_exceptions=True
+            )
+            if old is not None:
+                await asyncio.wait_for(old.stop(), timeout=1)
