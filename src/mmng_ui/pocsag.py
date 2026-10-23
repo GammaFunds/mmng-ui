@@ -46,6 +46,7 @@ from textual.widgets import (
 from mmng_ui._version import __version__
 from mmng_ui.capcode_db import CapcodeDB
 from mmng_ui.reader import ParseLine
+from mmng_ui.sdr import RTLFMReceiver, SDRConfig, SdrError
 
 
 def parse_ports(port_str: str) -> list[PortConfig]:
@@ -141,6 +142,9 @@ class UDPHandler(asyncio.DatagramProtocol):
         self.status.receiver = 'Closed'
 
     def datagram_received(self, data, addr):
+        sdr_session = getattr(self.app, 'sdr_session', None)
+        if sdr_session is not None and sdr_session.state in ('starting', 'running', 'stopping', 'cleanup_failed'):
+            return
         self.last_activity_time = self.loop.time()
         self.status.ip_address = addr[0]
         if self.app.app.sox_rate:
@@ -453,6 +457,10 @@ class FeedWidget(Widget):
         self.capcode_db = capcode_db
         self.process = None
         self.sox_process = None
+        self.sdr_session = None
+        self._sdr_start_worker = None
+        self._sdr_stop_worker = None
+        self._sdr_unmounting = False
         self.message_count = []
 
     DEFAULT_CSS = """
@@ -470,6 +478,106 @@ FeedWidget {
                 yield StatusWidget(id=f'status-{self.port}', classes='feed-status')
                 yield Sparkline([], id=f'spark-{self.port}')
         yield MsgsPerSecond(id=f'msgs-per-second-{self.port}', message_count_ref=self.message_count, classes='feed-mps')
+        with Horizontal(classes='sdr-controls'):
+            yield Button(
+                'Start SDR',
+                id=f'sdr-start-{self.port}',
+                disabled=getattr(self.app, 'sdr_config', None) is None,
+            )
+            yield Button('Stop SDR', id=f'sdr-stop-{self.port}', disabled=True)
+            yield Label('RTL-SDR process: stopped', id=f'sdr-state-{self.port}')
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == f'sdr-start-{self.port}' and (
+            self._sdr_start_worker is None or self._sdr_start_worker.is_finished
+        ):
+            self._sdr_start_worker = self.run_worker(
+                self._run_sdr_start(),
+                group=f'sdr-start-{self.port}',
+                name=f'sdr-start-{self.port}',
+                exclusive=False,
+                exit_on_error=False,
+            )
+        elif event.button.id == f'sdr-stop-{self.port}' and (
+            self._sdr_stop_worker is None or self._sdr_stop_worker.is_finished
+        ):
+            self._sdr_stop_worker = self.run_worker(
+                self._run_sdr_stop(),
+                group=f'sdr-stop-{self.port}',
+                name=f'sdr-stop-{self.port}',
+                exclusive=False,
+                exit_on_error=False,
+            )
+
+    async def _run_sdr_start(self) -> None:
+        try:
+            await self.start_sdr()
+        except Exception as exc:  # noqa: BLE001 - retain and display unexpected worker failures
+            if not self._sdr_unmounting:
+                state = (
+                    self.sdr_session.state
+                    if self.sdr_session and self.sdr_session.state == 'cleanup_failed'
+                    else 'error'
+                )
+                self._show_sdr_state(state, str(exc))
+        finally:
+            self._sdr_start_worker = None
+
+    async def _run_sdr_stop(self) -> None:
+        try:
+            await self.stop_sdr()
+        except Exception as exc:  # noqa: BLE001 - retain and display unexpected worker failures
+            if not self._sdr_unmounting:
+                self._show_sdr_state('cleanup_failed', str(exc))
+        finally:
+            self._sdr_stop_worker = None
+
+    async def start_sdr(self) -> None:
+        """Start configured RTL-SDR acquisition only after explicit TUI input."""
+        config = getattr(self.app, 'sdr_config', None)
+        if config is None:
+            return
+        if self.app.sox_rate and str(self.app.sox_rate) != '22050':
+            self._show_sdr_state('error', 'SoX input rate must be 22050 for RTL-SDR')
+            return
+        if self.app.sox_rate:
+            sink = self.sox_process.stdin if self.sox_process is not None else None
+        else:
+            sink = self.process.stdin if self.process is not None else None
+        if sink is None:
+            self._show_sdr_state('error', 'multimon-ng input is unavailable')
+            return
+        if self.sdr_session is None:
+            self.sdr_session = RTLFMReceiver(config, sink, on_state=self._show_sdr_state)
+        try:
+            await self.sdr_session.start()
+        except SdrError as exc:
+            self._show_sdr_state('error', str(exc))
+
+    async def stop_sdr(self) -> None:
+        if self.sdr_session is not None:
+            await self.sdr_session.stop()
+
+    async def on_unmount(self) -> None:
+        self._sdr_unmounting = True
+        if self.sdr_session is not None:
+            try:
+                await self.sdr_session.stop()
+            except Exception:  # noqa: BLE001 - shutdown must retain unresolved ownership
+                # The receiver retains ownership and exposes cleanup_failed/error.
+                return
+
+    def _show_sdr_state(self, state: str, error: str | None) -> None:
+        if self._sdr_unmounting or not self.is_mounted:
+            return
+        label = self.query_one(f'#sdr-state-{self.port}', Label)
+        active = state in ('starting', 'running', 'stopping', 'cleanup_failed')
+        text = f'RTL-SDR process: {state}' + (' (UDP paused)' if active else '')
+        label.update(text + (f' - {error}' if error else ''))
+        start = self.query_one(f'#sdr-start-{self.port}', Button)
+        stop = self.query_one(f'#sdr-stop-{self.port}', Button)
+        start.disabled = active or getattr(self.app, 'sdr_config', None) is None
+        stop.disabled = not active
 
     async def on_mount(self) -> None:
         """Setup the initial UI components."""
@@ -649,6 +757,7 @@ class Pocsag(App):
         sox_binary: str | None,
         sox_rate: int | None,
         capcode_db: CapcodeDB | None = None,
+        sdr_config: SDRConfig | None = None,
     ) -> None:
         self.mmng_binary = mmng_binary
         self.sox_binary = sox_binary
@@ -656,6 +765,7 @@ class Pocsag(App):
         self.charset = charset
         self.sox_rate = sox_rate
         self.capcode_db = capcode_db
+        self.sdr_config = sdr_config
         self.mmng = Executable(command=mmng_binary, resolved_path=shutil.which(mmng_binary), version=None)
         if self.sox_binary and self.sox_rate:
             self.sox = Executable(command=sox_binary, resolved_path=shutil.which(sox_binary) or None, version=None)
@@ -746,6 +856,9 @@ def _serve_mode(host: str | None, port: int) -> None:
     help='Path to sox binary (this does not imply that sox will run',
 )
 @click.option('--sox-rate', '-r', required=False, type=str, help='Input samplerate for sox to convert from')
+@click.option('--sdr-frequency-hz', required=False, type=int, help='RTL-SDR receive frequency in Hz')
+@click.option('--sdr-gain-db', required=False, type=float, help='RTL-SDR manual tuner gain in dB')
+@click.option('--sdr-device-index', required=False, type=int, default=0, help='RTL-SDR device index')
 @click.option(
     '--port',
     '-p',
@@ -766,7 +879,20 @@ def _serve_mode(host: str | None, port: int) -> None:
 @click.option('--serve-host', required=False, type=str, help='Host/IP to serve the app on (when using --serve)')
 @click.option('--serve-port', required=False, type=int, help='Port to serve the app on (when using --serve)')
 @click.version_option(version=__version__)
-def main(mmng_binary, sox_binary, sox_rate, port, charset, capcodes, serve, serve_host, serve_port):
+def main(
+    mmng_binary,
+    sox_binary,
+    sox_rate,
+    sdr_frequency_hz,
+    sdr_gain_db,
+    sdr_device_index,
+    port,
+    charset,
+    capcodes,
+    serve,
+    serve_host,
+    serve_port,
+):
     if serve or serve_host or serve_port:
         if not serve:
             serve = True
@@ -786,6 +912,17 @@ def main(mmng_binary, sox_binary, sox_rate, port, charset, capcodes, serve, serv
                 click.echo(f'sox binary not found!  I searched for "{sox_binary}"', err=True)
                 sys.exit(1)
 
+        if (sdr_frequency_hz is None) != (sdr_gain_db is None):
+            message = '--sdr-frequency-hz and --sdr-gain-db must be provided together'
+            raise click.UsageError(message)
+
+        sdr_config = None
+        if sdr_frequency_hz is not None:
+            try:
+                sdr_config = SDRConfig(sdr_frequency_hz, sdr_gain_db, sdr_device_index)
+            except ValueError as exc:
+                raise click.BadParameter(str(exc), param_hint='--sdr-frequency-hz/--sdr-gain-db') from exc
+
         port_configs = parse_ports(port)
         capcode_db = CapcodeDB.load(capcodes) if capcodes else None
         Pocsag(
@@ -795,6 +932,7 @@ def main(mmng_binary, sox_binary, sox_rate, port, charset, capcodes, serve, serv
             port_configs=port_configs,
             charset=charset,
             capcode_db=capcode_db,
+            sdr_config=sdr_config,
         ).run()
 
 

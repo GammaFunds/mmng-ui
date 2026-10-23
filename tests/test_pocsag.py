@@ -1,5 +1,8 @@
+import asyncio
 import importlib
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.text import Text
@@ -18,6 +21,7 @@ from textual.widgets import (
     TabPane,
 )
 
+import mmng_ui.pocsag as pocsag_module
 from mmng_ui.capcode_db import CapcodeDB
 from mmng_ui.pocsag import (
     AboutScreen,
@@ -33,6 +37,7 @@ from mmng_ui.pocsag import (
     SaveScreen,
     Status,
     StatusWidget,
+    UDPHandler,
     _extract_table_rows,
     _format_as_csv,
     _format_as_json,
@@ -40,6 +45,7 @@ from mmng_ui.pocsag import (
     _serve_mode,
     parse_ports,
 )
+from mmng_ui.sdr import DeviceBusyError, RTLFMReceiver, SDRConfig
 
 
 class StatusApp(App):
@@ -600,7 +606,7 @@ def test_serve_mode_missing_dependency_exits(monkeypatch):
     """Test _serve_mode exits when textual-serve is missing."""
 
     def mock_import(name, *args, **kwargs):
-        if name == 'textual_serve':
+        if name == 'textual_serve.server':
             raise ImportError("No module named 'textual_serve'")
         return importlib.__import__(name, *args, **kwargs)
 
@@ -693,6 +699,973 @@ def test_parse_ports_empty():
     """Test parse_ports raises ValueError for empty string."""
     with pytest.raises(ValueError):
         parse_ports('')
+
+
+@pytest.mark.asyncio
+async def test_sdr_start_stop_controls_do_not_auto_start_with_configuration(monkeypatch):
+    starts = []
+
+    async def start(self):
+        starts.append(self)
+
+    monkeypatch.setattr(RTLFMReceiver, 'start', start)
+    app = MainScreenTestApp()
+    app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not starts
+        assert pilot.app.screen.query_one('#sdr-start-8888').disabled is False
+        assert pilot.app.screen.query_one('#sdr-stop-8888').disabled is True
+
+
+@pytest.mark.asyncio
+async def test_sdr_controls_require_configuration_and_never_auto_start(monkeypatch):
+    starts = []
+    subprocess_calls = []
+
+    async def start(self):
+        starts.append(self)
+
+    async def create_subprocess_exec(*args, **_kwargs):
+        subprocess_calls.append(args)
+        message = 'unexpected subprocess creation'
+        raise AssertionError(message)
+
+    async def detect_version(_self):
+        return '1.4.0', True
+
+    monkeypatch.setattr(RTLFMReceiver, 'start', start)
+    monkeypatch.setattr(pocsag_module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect_version)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', lambda _feed: None)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert getattr(pilot.app, 'sdr_config', None) is None
+        start = pilot.app.screen.query_one('#sdr-start-8888')
+        stop = pilot.app.screen.query_one('#sdr-stop-8888')
+        assert start.disabled is True
+        assert stop.disabled is True
+        assert pilot.app.screen.region.contains_region(start.region)
+        assert pilot.app.screen.region.contains_region(stop.region)
+        assert starts == []
+        assert subprocess_calls == []
+
+        feed = pilot.app.screen.query_one(FeedWidget)
+        pilot.app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+        # Exercise the state callback after configuration becomes available.
+        feed._show_sdr_state('stopped', None)  # noqa: SLF001
+
+        assert start.disabled is False
+        assert stop.disabled is True
+        assert starts == []
+        assert subprocess_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sdr_buttons_start_and_stop_the_isolated_receiver(monkeypatch):
+    events = []
+
+    class Sink:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        def drain(self):
+            pass
+
+    sink = Sink()
+
+    class FakeReceiver:
+        def __init__(self, config, receiver_sink, on_state):
+            events.append(('configure', config, receiver_sink))
+            self.on_state = on_state
+            self.state = 'stopped'
+
+        async def start(self):
+            events.append(('start',))
+            self.state = 'running'
+            self.on_state('running', None)
+
+        async def stop(self):
+            if self.state == 'stopped':
+                return
+            events.append(('stop',))
+            self.state = 'stopped'
+            self.on_state('stopped', None)
+
+    def start_decoder(feed):
+        feed.process = SimpleNamespace(stdin=sink)
+
+    monkeypatch.setattr(pocsag_module, 'RTLFMReceiver', FakeReceiver)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', start_decoder)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+    app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert events == []
+        start = pilot.app.screen.query_one('#sdr-start-8888')
+        stop = pilot.app.screen.query_one('#sdr-stop-8888')
+        assert pilot.app.screen.region.contains_region(start.region)
+        assert pilot.app.screen.region.contains_region(stop.region)
+        assert start.disabled is False
+        assert stop.disabled is True
+        await pilot.click('#sdr-start-8888')
+        await pilot.pause()
+        assert events[0] == ('configure', app.sdr_config, sink)
+        assert events[1] == ('start',)
+        assert start.disabled is True
+        assert stop.disabled is False
+
+        feed = pilot.app.screen.query_one(FeedWidget)
+        handler = UDPHandler.__new__(UDPHandler)
+        handler.app = feed
+        handler.loop = SimpleNamespace(time=lambda: 10.0)
+        handler.port = 8888
+        handler.status = SimpleNamespace()
+        handler.last_activity_time = 0
+        handler.datagram_received(b'active', ('192.0.2.12', 8888))
+        assert sink.data == []
+
+        await pilot.click('#sdr-stop-8888')
+        await pilot.pause()
+        assert events[-1] == ('stop',)
+        assert start.disabled is False
+        assert stop.disabled is True
+
+        handler.datagram_received(b'restored', ('192.0.2.12', 8888))
+        assert sink.data == [b'restored']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unmount_during_stop', [False, True])
+async def test_textual_restart_excludes_udp_until_stop_coordinator_finishes(monkeypatch, unmount_during_stop):
+    pump_finished = asyncio.Event()
+    complete_stop = asyncio.Event()
+    unmount_started = asyncio.Event()
+    spawned = []
+
+    class Process:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+            self.reaped = False
+
+        async def wait(self):
+            await self.exited.wait()
+            self.reaped = True
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+        def kill(self):
+            self.terminate()
+
+    class Drained:
+        def __await__(self):
+            if False:
+                yield None
+
+    class Sink:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        def drain(self):
+            return Drained()
+
+    processes = [Process(), Process()]
+    sink = Sink()
+
+    async def spawn(*_args, **_kwargs):
+        process = processes[len(spawned)]
+        spawned.append(process)
+        return process
+
+    async def detect_version(_self):
+        return '1.4.0', True
+
+    def start_decoder(feed):
+        feed.process = SimpleNamespace(stdin=sink)
+
+    original_terminate = RTLFMReceiver._terminate_process  # noqa: SLF001
+    original_unmount = FeedWidget.on_unmount
+    held_once = False
+
+    async def pause_stop_after_pump(receiver):
+        nonlocal held_once
+        await original_terminate(receiver)
+        if not held_once:
+            held_once = True
+            await asyncio.wait_for(asyncio.shield(receiver._task), timeout=1)  # noqa: SLF001
+            pump_finished.set()
+            await complete_stop.wait()
+
+    async def observe_unmount(feed):
+        unmount_started.set()
+        await original_unmount(feed)
+
+    monkeypatch.setattr(pocsag_module.asyncio, 'create_subprocess_exec', spawn)
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect_version)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', start_decoder)
+    monkeypatch.setattr(FeedWidget, 'on_unmount', observe_unmount)
+    monkeypatch.setattr(RTLFMReceiver, '_terminate_process', pause_stop_after_pump)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+    app.sdr_config = SDRConfig(123_456_789, 12)
+    stop_click = removal = None
+    async with app.run_test(size=(80, 24)) as pilot:
+        try:
+            await pilot.pause()
+            feed = app.screen.query_one(FeedWidget)
+            await asyncio.wait_for(pilot.click('#sdr-start-8888'), timeout=1)
+            receiver = feed.sdr_session
+            stop_click = asyncio.create_task(pilot.click('#sdr-stop-8888'))
+            await asyncio.wait_for(pump_finished.wait(), timeout=1)
+            stop_worker = feed._sdr_stop_worker  # noqa: SLF001
+            assert receiver._task.done()  # noqa: SLF001
+            assert processes[0].reaped
+            assert receiver.state == 'stopping'
+            assert app.screen.query_one('#sdr-start-8888').disabled is True
+            assert 'stopping' in app.screen.query_one('#sdr-state-8888').content
+            assert receiver._device_owners[0] is receiver  # noqa: SLF001
+
+            handler = UDPHandler.__new__(UDPHandler)
+            handler.app = feed
+            handler.loop = SimpleNamespace(time=lambda: 10.0)
+            handler.status = SimpleNamespace()
+            handler.last_activity_time = 0
+            handler.datagram_received(b'pending-stop', ('192.0.2.12', 8888))
+            assert sink.data == []
+            await asyncio.wait_for(pilot.click('#sdr-start-8888'), timeout=1)
+            assert len(spawned) == 1
+            competitor = RTLFMReceiver(app.sdr_config, sink)
+            with pytest.raises(DeviceBusyError):
+                await competitor.start()
+
+            if unmount_during_stop:
+                removal = asyncio.ensure_future(feed.remove())
+                await asyncio.wait_for(unmount_started.wait(), timeout=1)
+                assert not removal.done()
+            complete_stop.set()
+            await asyncio.wait_for(stop_worker.wait(), timeout=1)
+            await asyncio.wait_for(stop_click, timeout=1)
+            if removal is not None:
+                await asyncio.wait_for(removal, timeout=1)
+            assert receiver.state == 'stopped'
+            assert 0 not in receiver._device_owners  # noqa: SLF001
+            if not unmount_during_stop:
+                assert app.screen.query_one('#sdr-start-8888').disabled is False
+                await asyncio.wait_for(pilot.click('#sdr-start-8888'), timeout=1)
+                assert receiver.state == 'running'
+                assert receiver.process is processes[1]
+                assert receiver._device_owners[0] is receiver  # noqa: SLF001
+                handler.datagram_received(b'restarted', ('192.0.2.12', 8888))
+                assert sink.data == []
+                with pytest.raises(DeviceBusyError):
+                    await competitor.start()
+        finally:
+            complete_stop.set()
+            pending = [task for task in (stop_click, removal) if task is not None]
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_textual_stop_event_is_processed_during_delayed_sdr_spawn(monkeypatch):
+    spawn_started = asyncio.Event()
+    allow_spawn = asyncio.Event()
+    stop_processed = asyncio.Event()
+    states = []
+
+    class Process:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+            self.wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            await self.exited.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+        def kill(self):
+            self.returncode = -9
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+    class Sink:
+        def write(self, _data):
+            pass
+
+        async def drain(self):
+            pass
+
+    process = Process()
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        spawn_started.set()
+        await allow_spawn.wait()
+        return process
+
+    async def detect_version(_self):
+        return '1.4.0', True
+
+    def start_decoder(feed):
+        feed.process = SimpleNamespace(stdin=Sink())
+
+    original_show_state = FeedWidget._show_sdr_state  # noqa: SLF001
+
+    def show_state(feed, state, error):
+        states.append(state)
+        if state == 'stopping':
+            stop_processed.set()
+        original_show_state(feed, state, error)
+
+    monkeypatch.setattr(pocsag_module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect_version)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', start_decoder)
+    monkeypatch.setattr(FeedWidget, '_show_sdr_state', show_state)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+    app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+    start_click = stop_click = None
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        try:
+            await pilot.pause()
+            assert states == []
+            assert pilot.app.screen.query_one('#sdr-state-8888').content == 'RTL-SDR process: stopped'
+
+            start_click = asyncio.create_task(pilot.click('#sdr-start-8888'))
+            await asyncio.wait_for(spawn_started.wait(), timeout=1)
+            assert 'starting' in states
+            assert pilot.app.screen.query_one('#sdr-start-8888').region.width > 0
+
+            async def interactive_pause(delay=None):
+                if delay is not None:
+                    await asyncio.sleep(delay)
+                else:
+                    await asyncio.sleep(0)
+
+            pilot.pause = interactive_pause
+
+            stop_click = asyncio.create_task(pilot.click('#sdr-stop-8888'))
+            await asyncio.wait_for(stop_processed.wait(), timeout=0.2)
+            assert pilot.app.screen.query_one('#sdr-state-8888').content == 'RTL-SDR process: stopping (UDP paused)'
+
+            allow_spawn.set()
+            await asyncio.wait_for(asyncio.gather(start_click, stop_click), timeout=1)
+            feed = pilot.app.screen.query_one(FeedWidget)
+            assert 'running' not in states
+            assert process.returncode == -15
+            assert process.wait_calls >= 1
+            assert feed.sdr_session.state == 'stopped'
+            assert feed.sdr_session._task.done()  # noqa: SLF001
+            assert 0 not in feed.sdr_session._device_owners  # noqa: SLF001
+            assert states[-1] == 'stopped'
+            assert feed._sdr_start_worker is None  # noqa: SLF001
+        finally:
+            allow_spawn.set()
+            for task in (start_click, stop_click):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (start_click, stop_click) if task is not None), return_exceptions=True
+            )
+
+
+@pytest.mark.asyncio
+async def test_widget_unmount_during_startup_cleans_child_without_running(monkeypatch):
+    spawn_started = asyncio.Event()
+    allow_spawn = asyncio.Event()
+    stopping = asyncio.Event()
+    states = []
+
+    class Process:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+            self.wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            await self.exited.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+        def kill(self):
+            self.terminate()
+
+    class Sink:
+        def write(self, _data):
+            pass
+
+        async def drain(self):
+            pass
+
+    process = Process()
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        spawn_started.set()
+        await allow_spawn.wait()
+        return process
+
+    async def detect_version(_self):
+        return '1.4.0', True
+
+    def start_decoder(feed):
+        feed.process = SimpleNamespace(stdin=Sink())
+
+    original_show_state = FeedWidget._show_sdr_state  # noqa: SLF001
+
+    def show_state(feed, state, error):
+        states.append(state)
+        if state == 'stopping':
+            stopping.set()
+        original_show_state(feed, state, error)
+
+    monkeypatch.setattr(pocsag_module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect_version)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', start_decoder)
+    monkeypatch.setattr(FeedWidget, '_show_sdr_state', show_state)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+    app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+    start_click = remove_task = None
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        try:
+            await pilot.pause()
+            feed = pilot.app.screen.query_one(FeedWidget)
+            start_click = asyncio.create_task(pilot.click('#sdr-start-8888'))
+            await asyncio.wait_for(spawn_started.wait(), timeout=1)
+
+            async def interactive_pause(delay=None):
+                if delay is not None:
+                    await asyncio.sleep(delay)
+                else:
+                    await asyncio.sleep(0)
+
+            pilot.pause = interactive_pause
+            remove_task = asyncio.ensure_future(feed.remove())
+            await asyncio.wait_for(stopping.wait(), timeout=0.2)
+            assert not remove_task.done()
+            allow_spawn.set()
+            await asyncio.wait_for(asyncio.gather(start_click, remove_task), timeout=1)
+
+            assert process.returncode == -15
+            assert process.wait_calls >= 1
+            assert feed.sdr_session.state == 'stopped'
+            assert 'running' not in states
+            assert 0 not in feed.sdr_session._device_owners  # noqa: SLF001
+        finally:
+            allow_spawn.set()
+            for task in (start_click, remove_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (start_click, remove_task) if task is not None), return_exceptions=True
+            )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_during_widget_shutdown_keeps_udp_gated(monkeypatch):
+    process = None
+
+    class PermissionDeniedProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+            self.allow_cleanup = False
+
+        async def wait(self):
+            await self.exited.wait()
+            return self.returncode
+
+        def terminate(self):
+            if not self.allow_cleanup:
+                raise PermissionError('shutdown signal denied')  # noqa: EM101, TRY003
+            self.returncode = -15
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+        def kill(self):
+            raise PermissionError('shutdown kill denied')  # noqa: EM101, TRY003
+
+    class Sink:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        async def drain(self):
+            pass
+
+    sink = Sink()
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        nonlocal process
+        process = PermissionDeniedProcess()
+        return process
+
+    async def detect_version(_self):
+        return '1.4.0', True
+
+    def start_decoder(feed):
+        feed.process = SimpleNamespace(stdin=sink)
+
+    monkeypatch.setattr(pocsag_module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect_version)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', start_decoder)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+    app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        feed = pilot.app.screen.query_one(FeedWidget)
+        await pilot.click('#sdr-start-8888')
+        receiver = feed.sdr_session
+        assert receiver.state == 'running'
+
+        await feed.remove()
+        assert process.returncode is None
+        assert receiver.state == 'cleanup_failed'
+        assert receiver.error == 'shutdown signal denied'
+        assert receiver._device_owners[0] is receiver  # noqa: SLF001
+
+        handler = UDPHandler.__new__(UDPHandler)
+        handler.app = feed
+        handler.loop = SimpleNamespace(time=lambda: 10.0)
+        handler.port = 8888
+        handler.status = SimpleNamespace()
+        handler.last_activity_time = 0
+        handler.datagram_received(b'must-stay-gated', ('192.0.2.12', 8888))
+        assert sink.data == []
+
+        process.allow_cleanup = True
+        await receiver.stop()
+        assert receiver.state == 'stopped'
+
+
+@pytest.mark.asyncio
+async def test_pending_start_cleanup_failure_keeps_stop_retry_available(monkeypatch):
+    spawn_started = asyncio.Event()
+    allow_spawn = asyncio.Event()
+    stopping = asyncio.Event()
+    stopped = asyncio.Event()
+    start_worker_finished = asyncio.Event()
+    stop_worker_finished = asyncio.Event()
+    stop_sdr_waiting = asyncio.Event()
+    allow_stop_worker = asyncio.Event()
+    stop_worker_handles = []
+    states = []
+
+    class Process:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+
+        async def wait(self):
+            await self.exited.wait()
+            return self.returncode
+
+        def terminate(self):
+            if self.returncode is None:
+                raise PermissionError('temporary termination denial')  # noqa: EM101, TRY003
+
+        def kill(self):
+            raise PermissionError('temporary kill denial')  # noqa: EM101, TRY003
+
+        def finish_cleanup(self):
+            self.returncode = -15
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+    class Sink:
+        def write(self, _data):
+            pass
+
+        async def drain(self):
+            pass
+
+    process = Process()
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        spawn_started.set()
+        await allow_spawn.wait()
+        return process
+
+    async def detect_version(_self):
+        return '1.4.0', True
+
+    def start_decoder(feed):
+        feed.process = SimpleNamespace(stdin=Sink())
+
+    original_show_state = FeedWidget._show_sdr_state  # noqa: SLF001
+
+    def show_state(feed, state, error):
+        states.append(state)
+        if state == 'stopping':
+            stopping.set()
+        elif state == 'stopped':
+            stopped.set()
+        original_show_state(feed, state, error)
+
+    original_run_start = FeedWidget._run_sdr_start  # noqa: SLF001
+    original_run_stop = FeedWidget._run_sdr_stop  # noqa: SLF001
+    original_stop_sdr = FeedWidget.stop_sdr
+    hold_first_stop_result = True
+
+    async def observe_start_worker(feed):
+        try:
+            await original_run_start(feed)
+        finally:
+            start_worker_finished.set()
+
+    async def observe_stop_worker(feed):
+        stop_worker_handles.append(feed._sdr_stop_worker)  # noqa: SLF001
+        try:
+            await original_run_stop(feed)
+        finally:
+            stop_worker_finished.set()
+
+    async def hold_stop_result(feed):
+        nonlocal hold_first_stop_result
+        try:
+            await original_stop_sdr(feed)
+        finally:
+            if hold_first_stop_result:
+                hold_first_stop_result = False
+                stop_sdr_waiting.set()
+                await allow_stop_worker.wait()
+
+    monkeypatch.setattr(pocsag_module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect_version)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', start_decoder)
+    monkeypatch.setattr(FeedWidget, '_show_sdr_state', show_state)
+    monkeypatch.setattr(FeedWidget, '_run_sdr_start', observe_start_worker)
+    monkeypatch.setattr(FeedWidget, '_run_sdr_stop', observe_stop_worker)
+    monkeypatch.setattr(FeedWidget, 'stop_sdr', hold_stop_result)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+    app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+    start_click = stop_click = None
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        try:
+            await pilot.pause()
+            start_click = asyncio.create_task(pilot.click('#sdr-start-8888'))
+            await asyncio.wait_for(spawn_started.wait(), timeout=1)
+
+            async def interactive_pause(delay=None):
+                if delay is not None:
+                    await asyncio.sleep(delay)
+                else:
+                    await asyncio.sleep(0)
+
+            pilot.pause = interactive_pause
+            stop_click = asyncio.create_task(pilot.click('#sdr-stop-8888'))
+            await asyncio.wait_for(stopping.wait(), timeout=0.2)
+            allow_spawn.set()
+            await asyncio.wait_for(start_worker_finished.wait(), timeout=1)
+            await asyncio.wait_for(stop_sdr_waiting.wait(), timeout=1)
+
+            feed = pilot.app.screen.query_one(FeedWidget)
+            receiver = feed.sdr_session
+            start = pilot.app.screen.query_one('#sdr-start-8888')
+            stop = pilot.app.screen.query_one('#sdr-stop-8888')
+            label = pilot.app.screen.query_one('#sdr-state-8888')
+            assert receiver.state == 'cleanup_failed'
+            assert start.disabled is True
+            assert stop.disabled is False
+            assert 'cleanup_failed' in label.content
+            assert process.returncode is None
+            assert receiver._device_owners[0] is receiver  # noqa: SLF001
+
+            allow_stop_worker.set()
+            await asyncio.wait_for(stop_worker_finished.wait(), timeout=1)
+            await asyncio.wait_for(stop_worker_handles[0].wait(), timeout=1)
+            await asyncio.wait_for(asyncio.gather(start_click, stop_click), timeout=1)
+
+            process.terminate = process.finish_cleanup
+            stopped.clear()
+            await asyncio.wait_for(receiver.stop(), timeout=1)
+            await asyncio.wait_for(stopped.wait(), timeout=1)
+            assert receiver.state == 'stopped'
+            assert 0 not in receiver._device_owners  # noqa: SLF001
+            assert 'running' not in states
+        finally:
+            allow_spawn.set()
+            for task in (start_click, stop_click):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (start_click, stop_click) if task is not None),
+                return_exceptions=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_udp_resumes_only_after_stop_during_sdr_startup_cleans_up(monkeypatch):
+    spawn_started = asyncio.Event()
+    allow_spawn = asyncio.Event()
+    stop_requested = asyncio.Event()
+
+    class CompletedAwaitable:
+        def __await__(self):
+            if False:
+                yield None
+
+    class Sink:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        def drain(self):
+            return CompletedAwaitable()
+
+    class Process:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+
+        async def wait(self):
+            await self.exited.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+        def kill(self):
+            self.returncode = -9
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self.exited.set()
+
+    process = Process()
+    decoder_sink = Sink()
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        spawn_started.set()
+        await allow_spawn.wait()
+        return process
+
+    async def detect_version(_self):
+        return '1.4.0', True
+
+    def start_decoder(feed):
+        feed.process = SimpleNamespace(stdin=decoder_sink)
+
+    # Observe the real state callback without replacing its UI behavior.
+    original_show_state = FeedWidget._show_sdr_state  # noqa: SLF001
+
+    def show_state(feed, state, error):
+        if state == 'stopping':
+            stop_requested.set()
+        original_show_state(feed, state, error)
+
+    monkeypatch.setattr(pocsag_module.asyncio, 'create_subprocess_exec', create_subprocess_exec)
+    monkeypatch.setattr(MainScreen, '_detect_mmng_version', detect_version)
+    monkeypatch.setattr(FeedWidget, 'start_streaming', start_decoder)
+    monkeypatch.setattr(FeedWidget, '_show_sdr_state', show_state)
+
+    class StyledMainScreenTestApp(MainScreenTestApp):
+        CSS_PATH = str(Path(pocsag_module.__file__).with_name('pocsag.tcss'))
+
+    app = StyledMainScreenTestApp()
+    app.sdr_config = SDRConfig(frequency_hz=123_456_789, gain_db=12)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        feed = pilot.app.screen.query_one(FeedWidget)
+        assert process.returncode is None
+
+        start_task = asyncio.create_task(feed.start_sdr())
+        await asyncio.wait_for(spawn_started.wait(), timeout=1)
+        handler = UDPHandler.__new__(UDPHandler)
+        handler.app = feed
+        handler.loop = SimpleNamespace(time=lambda: 10.0)
+        handler.port = 8888
+        handler.status = SimpleNamespace()
+        handler.last_activity_time = 0
+        handler.datagram_received(b'during-start', ('192.0.2.21', 8888))
+        assert decoder_sink.data == []
+
+        stop_task = asyncio.create_task(feed.stop_sdr())
+        stop_signal_task = asyncio.create_task(stop_requested.wait())
+        try:
+            done, _ = await asyncio.wait_for(
+                asyncio.wait({stop_task, stop_signal_task}, return_when=asyncio.FIRST_COMPLETED), timeout=1
+            )
+            assert stop_signal_task in done
+            handler.datagram_received(b'during-stop', ('192.0.2.21', 8888))
+            assert decoder_sink.data == []
+
+            allow_spawn.set()
+            await asyncio.wait_for(asyncio.gather(start_task, stop_task), timeout=1)
+            assert process.returncode == -15
+            assert feed.sdr_session.state == 'stopped'
+            # STOPPED must include completion of the owned PCM pump.
+            assert feed.sdr_session._task is None or feed.sdr_session._task.done()  # noqa: SLF001
+
+            handler.datagram_received(b'after-cleanup', ('192.0.2.21', 8888))
+            assert decoder_sink.data == [b'after-cleanup']
+        finally:
+            allow_spawn.set()
+            if not stop_signal_task.done():
+                stop_signal_task.cancel()
+            await asyncio.gather(start_task, stop_task, return_exceptions=True)
+            await asyncio.gather(stop_signal_task, return_exceptions=True)
+
+
+def test_udp_handler_keeps_writing_raw_datagrams_to_the_decoder():
+    class Stdin:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        def drain(self):
+            pass
+
+    stdin = Stdin()
+    handler = UDPHandler.__new__(UDPHandler)
+    handler.app = SimpleNamespace(app=SimpleNamespace(sox_rate=None), process=SimpleNamespace(stdin=stdin))
+    handler.loop = SimpleNamespace(time=lambda: 10.0)
+    handler.port = 8888
+    handler.status = type('Status', (), {})()
+    handler.last_activity_time = 0
+
+    handler.datagram_received(b'\x00\x80', ('192.0.2.9', 8888))
+
+    assert stdin.data == [b'\x00\x80']
+    assert handler.status.ip_address == '192.0.2.9'
+    assert handler.last_activity_time == 10.0
+
+
+def test_udp_handler_keeps_using_sox_when_conversion_is_enabled():
+    class Stdin:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        def drain(self):
+            pass
+
+    sox_stdin = Stdin()
+    handler = UDPHandler.__new__(UDPHandler)
+    handler.app = SimpleNamespace(
+        app=SimpleNamespace(sox_rate=48000),
+        sox_process=SimpleNamespace(stdin=sox_stdin),
+        process=SimpleNamespace(stdin=Stdin()),
+    )
+    handler.loop = SimpleNamespace(time=lambda: 10.0)
+    handler.port = 8888
+    handler.status = SimpleNamespace()
+    handler.last_activity_time = 0
+
+    handler.datagram_received(b'\x01\x02', ('192.0.2.10', 8888))
+
+    assert sox_stdin.data == [b'\x01\x02']
+    assert handler.app.process.stdin.data == []
+
+
+def test_udp_handler_does_not_mix_datagrams_into_active_sdr_audio():
+    class Stdin:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        def drain(self):
+            pass
+
+    stdin = Stdin()
+    handler = UDPHandler.__new__(UDPHandler)
+    handler.app = SimpleNamespace(
+        app=SimpleNamespace(sox_rate=None),
+        process=SimpleNamespace(stdin=stdin),
+        sdr_session=SimpleNamespace(state='running'),
+    )
+    handler.loop = SimpleNamespace(time=lambda: 10.0)
+    handler.port = 8888
+    handler.status = SimpleNamespace()
+    handler.last_activity_time = 0
+
+    handler.datagram_received(b'\x01\x02', ('192.0.2.11', 8888))
+
+    assert stdin.data == []
 
 
 # --- FeedWidget compose tests ---

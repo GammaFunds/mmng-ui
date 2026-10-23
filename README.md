@@ -119,6 +119,24 @@ With release 1.3.0, you can use the `--sox-rate` (optionally with `--sox-binary`
 an instance of `sox` in the decoding pipeline, before `multimon-ng`. You can use the same format as `sox` accepts,
 for example, `48k`, or `32000`.
 
+### Direct RTL-SDR reception
+
+The optional `rtl_fm` backend can receive directly from one RTL-SDR-compatible device and feed 22050 Hz mono PCM into
+the existing `multimon-ng` decoder. Configure the frequency in Hz and a manual gain in dB when starting the app:
+
+```shell
+mmng-ui --sdr-frequency-hz 123456789 --sdr-gain-db 17.5
+```
+
+The device index defaults to `0`; `--sdr-device-index` selects another single device. Use the TUI's **Start SDR** and
+**Stop SDR** buttons to control acquisition. SDR is never started automatically. With SoX enabled, use an input rate of
+`22050` for SDR acquisition; other SoX input rates remain available for the existing UDP workflow. While SDR is active
+on a feed, UDP datagrams continue to arrive but are not forwarded to that feed's decoder, so the two PCM sources are
+not mixed.
+
+Offline tests can simulate argument construction and subprocess/PCM lifecycle without an SDR. They do not validate live
+radio reception, device compatibility, or decoded signal quality; those require separate hardware testing.
+
 ### Multiple ports and tabs
 
 You can listen on multiple UDP ports simultaneously by passing `--port` (or `-p`) more than once:

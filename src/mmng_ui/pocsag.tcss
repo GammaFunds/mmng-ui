@@ -32,6 +32,15 @@
     height: auto;
 }
 
+.sdr-controls {
+    height: 3;
+    align: left middle;
+}
+
+.sdr-controls > Button {
+    margin-right: 1;
+}
+
 HelpScreen, FilterScreen {
     align: center middle;
 }
