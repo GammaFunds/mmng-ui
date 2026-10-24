@@ -21,7 +21,7 @@ from textual import events, work
 from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Center, Container, Horizontal, VerticalScroll
+from textual.containers import Container, Horizontal, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
@@ -30,7 +30,6 @@ from textual.widgets import (
     Button,
     ContentSwitcher,
     DataTable,
-    Digits,
     Footer,
     Header,
     Input,
@@ -238,34 +237,30 @@ class AboutScreen(ModalScreen):
     BINDINGS = [('escape,space,q', 'app.pop_screen', 'Close')]
 
     def compose(self) -> ComposeResult:
-        mmng_info = f"""
-## multimon-ng
-
-```
-Path: {self.app.mmng.resolved_path}
-Version: {self.app.mmng.version}
-```
-        """
-        if self.app.sox_rate:
-            sox_info = f"""
-## sox
-
-```
-Path: {self.app.sox.resolved_path}
-Version: {self.app.sox.version}
-```
-        """
-        with Container(id='about'):
-            yield Markdown('# This is mmng-ui!')
-            with Center():
-                yield Label('Version', classes='version')
-            with Center():
-                yield Digits(__version__, classes='version')
+        with VerticalScroll(id='about'):
+            yield Label('This is mmng-ui!', id='about-title')
+            yield Label(f'mmng-ui version: {__version__}', id='about-version', markup=False)
             yield Rule(line_style='double')
-            with Container(id='app-versions'):
-                yield Markdown(mmng_info)
+            with Container(id='app-versions', classes='' if self.app.sox_rate else 'single-column'):
+                with Container(id='decoder-info', classes='app-version-section'):
+                    yield Label('multimon-ng', classes='app-version-title')
+                    yield Label(
+                        f'Path: {self.app.mmng.resolved_path}',
+                        id='decoder-path',
+                        classes='app-version-path',
+                        markup=False,
+                    )
+                    yield Label(f'Version: {self.app.mmng.version}', id='decoder-version', markup=False)
                 if self.app.sox_rate:
-                    yield Markdown(sox_info)
+                    with Container(id='sox-info', classes='app-version-section'):
+                        yield Label('sox', classes='app-version-title')
+                        yield Label(
+                            f'Path: {self.app.sox.resolved_path}',
+                            id='sox-path',
+                            classes='app-version-path',
+                            markup=False,
+                        )
+                        yield Label(f'Version: {self.app.sox.version}', id='sox-version', markup=False)
 
 
 class MsgsPerSecond(Sparkline):
@@ -909,6 +904,12 @@ FeedWidget {
 class MainScreen(Screen):
     def compose(self):
         yield Header()
+        yield Label(
+            'SDR configuration: Not configured\nRTL-SDR process: stopped',
+            id='sdr-profile-status',
+            classes='sdr-profile-status',
+            markup=False,
+        )
         with FeedTabbedContent():
             for cfg in self.app.port_configs:
                 title = cfg.name or f'Port {cfg.port}'
@@ -924,6 +925,9 @@ class MainScreen(Screen):
         self.app.json_capable = json_capable
         for feed in self.query(FeedWidget):
             feed.start_streaming()
+        profile_status_text = getattr(self.app, 'profile_status_text', None)
+        if profile_status_text is not None:
+            self.query_one('#sdr-profile-status', Label).update(profile_status_text())
 
     async def _detect_mmng_version(self) -> tuple[str, bool]:
         """Returns (version_string, json_capable)."""
@@ -977,6 +981,7 @@ class Pocsag(App):
     SCREENS = {'help': HelpScreen}
 
     BINDINGS = [
+        Binding(key='p', action='sdr_profiles', description='Profiles'),
         Binding(key='q', action='quit', description='Quit the app'),
         Binding(
             key='question_mark',
@@ -993,7 +998,6 @@ class Pocsag(App):
         ),
         Binding(key='r', action='rename_tab', description='Rename tab'),
         Binding(key='s', action='save_as', description='Save tab to file'),
-        Binding(key='p', action='sdr_profiles', description='SDR profiles'),
     ]
 
     def on_mount(self):
@@ -1040,8 +1044,42 @@ class Pocsag(App):
 
     def refresh_profile_views(self) -> None:
         for screen in self.screen_stack:
+            if isinstance(screen, MainScreen) and screen.is_mounted:
+                screen.query_one('#sdr-profile-status', Label).update(self.profile_status_text())
             if isinstance(screen, ProfilesScreen) and screen.is_mounted:
                 screen.refresh_profiles()
+
+    @staticmethod
+    def _format_sdr_config(config: SDRConfig) -> str:
+        return (
+            f'{config.frequency_hz} Hz | Device {config.device_index} | '
+            f'Gain {config.gain_db:g} dB | PPM {config.ppm_correction}'
+        )
+
+    def profile_status_text(self) -> str:
+        if not self.profiles_local:
+            return (
+                'Stored selection: unavailable in web mode\n'
+                'Next Start: unavailable in web mode\n'
+                'RTL-SDR process: unavailable in web mode'
+            )
+
+        selected = self.profile_catalog.selected_name or 'none'
+        if self.sdr_config is None:
+            next_start = 'Not configured'
+        else:
+            next_start = f'{self.profile_source}: {self._format_sdr_config(self.sdr_config)}'
+        receiver_states = []
+        active_states = {'starting', 'running', 'stopping', 'cleanup_failed'}
+        for feed in self.profile_feeds():
+            receiver = feed.sdr_session
+            state = receiver.state if receiver is not None else 'stopped'
+            status = f'Port {feed.port}: {state}'
+            if receiver is not None and state in active_states:
+                status += f' ({self._format_sdr_config(receiver.config)})'
+            receiver_states.append(status)
+        processes = '; '.join(receiver_states) or 'stopped'
+        return f'Stored selection: {selected}\nNext Start: {next_start}\nRTL-SDR process: {processes}'
 
     def _apply_profile_selection(self) -> None:
         selected = self.profile_catalog.selected

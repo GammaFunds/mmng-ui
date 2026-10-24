@@ -37,6 +37,11 @@
     align: left middle;
 }
 
+.sdr-profile-status {
+    height: auto;
+    padding: 0 1;
+}
+
 .sdr-controls > Button {
     margin-right: 1;
 }
@@ -64,14 +69,50 @@ AboutScreen {
 }
 
 #about {
-    width: 70%;
+    width: 90%;
+    max-width: 120;
     height: auto;
+    max-height: 90%;
     border: thick solid yellow;
     background: $boost;
+    padding: 1 2;
 }
 
-.version {
-    width: auto;
+#about-title, #about-version {
+    width: 1fr;
+    text-align: center;
+}
+
+#about-title {
+    text-style: bold;
+}
+
+#app-versions {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    grid-gutter: 1 2;
+    height: auto;
+}
+
+#app-versions.single-column {
+    grid-size: 1;
+    grid-columns: 1fr;
+}
+
+.app-version-section {
+    width: 1fr;
+    height: auto;
+}
+
+.app-version-title {
+    width: 1fr;
+    text-style: bold;
+}
+
+.app-version-path {
+    width: 1fr;
+    height: auto;
 }
 
 Rule {
@@ -80,12 +121,6 @@ Rule {
 
 .column {
     width: 50%;
-    height: auto;
-}
-
-#app-versions {
-    layout: grid;
-    grid-size: 2;
     height: auto;
 }
 

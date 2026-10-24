@@ -12,10 +12,10 @@ from textual.message import Message
 from textual.widgets import (
     Button,
     DataTable,
-    Digits,
     Footer,
     Header,
     Input,
+    Label,
     Markdown,
     RadioButton,
     RadioSet,
@@ -36,6 +36,7 @@ from mmng_ui.pocsag import (
     OutputMessage,
     Pocsag,
     PortConfig,
+    ProfilesScreen,
     RenameTabScreen,
     SaveScreen,
     Status,
@@ -175,12 +176,64 @@ async def test_help_screen_dismiss_space():
 
 # AboutScreen tests
 class AboutScreenApp(App):
+    CSS = Path(pocsag_module.__file__).with_name('pocsag.tcss').read_text()
+
     def __init__(self, has_sox: bool = False):
         self.mmng = Executable('multimon-ng', '/usr/bin/multimon-ng', '1.4.0')
         self.sox_rate = 48000 if has_sox else None
         if has_sox:
             self.sox = Executable('sox', '/usr/bin/sox', '14.4.2')
         super().__init__()
+
+
+def rendered_widget_text(screen, widget):
+    region = widget.region
+    strips = screen._compositor.render_strips()  # noqa: SLF001
+    return ''.join(strip.text[region.x : region.right] for strip in strips[region.y : region.bottom])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('size', [(80, 24), (120, 30)])
+@pytest.mark.parametrize('has_sox', [False, True])
+async def test_about_dialog_production_layout_and_readable_versions(size, has_sox):
+    long_path = '/synthetic/build/toolchain/' + 'decoder-installation/' * 6 + 'bin/multimon-ng'
+    app = AboutScreenApp(has_sox=has_sox)
+    app.mmng.resolved_path = long_path
+    app.mmng.version = '1.6.2'
+
+    async with app.run_test(size=size) as pilot:
+        app.push_screen(AboutScreen())
+        await pilot.pause()
+        dialog = app.screen.query_one('#about')
+        versions = app.screen.query_one('#app-versions')
+        decoder_path = app.screen.query_one('#decoder-path', Label)
+        rendered = '\n'.join(strip.text for strip in app.screen._compositor.render_strips())  # noqa: SLF001
+        visible_text = rendered.replace(' ', '').replace('\n', '')
+        decoder_path_text = rendered_widget_text(app.screen, decoder_path)
+        dialog_width = dialog.region.width
+        dialog_x = dialog.region.x
+        dialog_right = dialog.region.right
+        versions_width = versions.region.width
+        versions_right = versions.region.right
+        decoder_width = versions.children[0].region.width
+        decoder_path_right = decoder_path.region.right
+
+        await pilot.press('escape')
+        await pilot.pause()
+        assert not isinstance(app.screen, AboutScreen)
+        assert dialog_width >= int(size[0] * 0.85)
+        assert dialog_x >= 0
+        assert dialog_right <= size[0]
+        assert versions_width > 0
+        if not has_sox:
+            assert decoder_width >= int(versions_width * 0.8)
+        assert decoder_path_right <= versions_right
+        assert long_path.replace('/', '') in decoder_path_text.replace('Path:', '').replace(' ', '').replace('/', '')
+        assert 'Version:1.6.2' in visible_text
+        assert f'mmng-uiversion:{pocsag_module.__version__}' in visible_text
+        if has_sox:
+            assert '/usr/bin/sox' in rendered
+            assert '14.4.2' in rendered
 
 
 @pytest.mark.asyncio
@@ -190,14 +243,16 @@ async def test_about_screen_without_sox():
         pilot.app.push_screen(AboutScreen())
         await pilot.pause()
         about_screen = pilot.app.screen
-        digits = about_screen.query_one(Digits)
-        assert digits is not None
+        version_label = about_screen.query_one('#about-version', Label)
+        assert pocsag_module.__version__ in str(version_label.render())
         versions = about_screen.query_one('#app-versions')
         assert len(versions.children) == 1
-        mmng_md = versions.children[0]
-        assert isinstance(mmng_md, Markdown)
-        assert '/usr/bin/multimon-ng' in str(mmng_md._markdown)
-        assert '1.4.0' in str(mmng_md._markdown)
+        mmng_path = about_screen.query_one('#decoder-path', Label)
+        mmng_version = about_screen.query_one('#decoder-version', Label)
+        assert isinstance(mmng_path, Label)
+        assert isinstance(mmng_version, Label)
+        assert '/usr/bin/multimon-ng' in str(mmng_path.render())
+        assert '1.4.0' in str(mmng_version.render())
 
 
 @pytest.mark.asyncio
@@ -207,18 +262,22 @@ async def test_about_screen_with_sox():
         pilot.app.push_screen(AboutScreen())
         await pilot.pause()
         about_screen = pilot.app.screen
-        digits = about_screen.query_one(Digits)
-        assert digits is not None
+        version_label = about_screen.query_one('#about-version', Label)
+        assert pocsag_module.__version__ in str(version_label.render())
         versions = about_screen.query_one('#app-versions')
         assert len(versions.children) == 2
-        mmng_md = versions.children[0]
-        sox_md = versions.children[1]
-        assert isinstance(mmng_md, Markdown)
-        assert isinstance(sox_md, Markdown)
-        assert '/usr/bin/multimon-ng' in str(mmng_md._markdown)
-        assert '1.4.0' in str(mmng_md._markdown)
-        assert '/usr/bin/sox' in str(sox_md._markdown)
-        assert '14.4.2' in str(sox_md._markdown)
+        mmng_path = about_screen.query_one('#decoder-path', Label)
+        mmng_version = about_screen.query_one('#decoder-version', Label)
+        sox_path = about_screen.query_one('#sox-path', Label)
+        sox_version = about_screen.query_one('#sox-version', Label)
+        assert isinstance(mmng_path, Label)
+        assert isinstance(mmng_version, Label)
+        assert isinstance(sox_path, Label)
+        assert isinstance(sox_version, Label)
+        assert '/usr/bin/multimon-ng' in str(mmng_path.render())
+        assert '1.4.0' in str(mmng_version.render())
+        assert '/usr/bin/sox' in str(sox_path.render())
+        assert '14.4.2' in str(sox_version.render())
 
 
 @pytest.mark.asyncio
@@ -2373,6 +2432,10 @@ async def test_profile_crud_keyboard_production_css_80x24(profile_app):
         await fill_profile_editor(pilot, name='Renamed', ppm='25')
         assert app.sdr_config.ppm_correction == 25
         assert app.profile_catalog.selected_name == 'Renamed'
+        main = next(screen for screen in app.screen_stack if isinstance(screen, MainScreen))
+        status = str(main.query_one('#sdr-profile-status', Label).render())
+        assert 'Stored selection: Renamed' in status
+        assert 'PPM 25' in status
         app.screen.query_one('#profile-new').focus()
         await pilot.press('enter')
         await pilot.pause()
@@ -2394,6 +2457,9 @@ async def test_profile_crud_keyboard_production_css_80x24(profile_app):
         await pilot.pause()
         assert app.sdr_config is None
         assert load_profiles(default_profile_path()) == ProfileCatalog()
+        status = str(main.query_one('#sdr-profile-status', Label).render())
+        assert 'Stored selection: none' in status
+        assert 'Not configured' in status
         await pilot.press('escape')
         await pilot.pause()
         assert app.screen.query_one('#sdr-start-8888').disabled
@@ -2422,6 +2488,125 @@ async def test_profile_restore_cli_precedence_and_explicit_selection(profile_app
 
 
 @pytest.mark.asyncio
+async def test_profile_binding_is_visible_in_rendered_80x24_footer(profile_app):
+    app = profile_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        footer = app.screen.query_one(Footer)
+        profiles = next(key for key in footer.query('FooterKey') if key.key == 'p')
+        assert profiles.key_display == 'p'
+        assert profiles.description == 'Profiles'
+        assert profiles.region.width > 0
+        assert profiles.region.x >= 0
+        assert profiles.region.right <= 80
+        rendered = '\n'.join(strip.text for strip in app.screen._compositor.render_strips())  # noqa: SLF001
+        assert 'p Profiles' in rendered
+        await pilot.press('p')
+        await pilot.pause()
+        assert isinstance(app.screen, ProfilesScreen)
+        await pilot.press('escape')
+        await pilot.pause()
+        start = app.screen.query_one('#sdr-start-8888', Button)
+        stop = app.screen.query_one('#sdr-stop-8888', Button)
+        assert app.screen.region.contains_region(start.region)
+        assert app.screen.region.contains_region(stop.region)
+
+
+@pytest.mark.asyncio
+async def test_main_status_updates_after_profile_selection_with_all_tuning_fields(profile_app):
+    catalog = seed_profiles()
+    app = profile_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        status_label = app.screen.query_one('#sdr-profile-status', Label)
+        assert status_label.region.height > 0
+        assert app.screen.region.contains_region(status_label.region)
+        await pilot.press('p')
+        await pilot.pause()
+        await pilot.press('down')
+        await pilot.click(app.screen.query_one('#profile-select', Button))
+        await pilot.pause()
+        await pilot.press('escape')
+        await pilot.pause()
+
+        status = str(app.screen.query_one('#sdr-profile-status', Label).render())
+        assert 'Stored selection: Beta' in status
+        assert 'Next Start' in status
+        assert str(catalog.profiles[1].config.frequency_hz) in status
+        assert 'Device 1' in status
+        assert 'Gain 13' in status
+        assert 'PPM 10' in status
+        assert app.screen.query_one(FeedWidget).sdr_session is None
+        assert app.screen.region.contains_region(app.screen.query_one('#sdr-start-8888', Button).region)
+        assert app.screen.region.contains_region(app.screen.query_one('#sdr-stop-8888', Button).region)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cli', [False, True])
+async def test_main_status_shows_restored_selection_and_cli_precedence(profile_app, cli):
+    catalog = seed_profiles()
+    cli_config = SDRConfig(222222222, 20, 2, -3) if cli else None
+    app = profile_app(cli_config)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        status = str(app.screen.query_one('#sdr-profile-status', Label).render())
+        assert 'Stored selection: Alpha' in status
+        assert 'Next Start' in status
+        expected = cli_config if cli else catalog.selected.config
+        assert str(expected.frequency_hz) in status
+        assert f'Device {expected.device_index}' in status
+        assert f'Gain {expected.gain_db:g}' in status
+        assert f'PPM {expected.ppm_correction}' in status
+        assert ('CLI' if cli else 'Profile: Alpha') in status
+        assert app.screen.query_one(FeedWidget).sdr_session is None
+
+
+@pytest.mark.asyncio
+async def test_main_status_reports_not_configured_without_sdr_configuration(profile_app):
+    app = profile_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        status = str(app.screen.query_one('#sdr-profile-status', Label).render())
+        assert 'Not configured' in status
+        assert 'Port 8888: stopped' in status
+        assert app.screen.query_one(FeedWidget).sdr_session is None
+
+
+@pytest.mark.asyncio
+async def test_main_status_shows_live_receiver_state_separately_from_next_start(profile_app):
+    catalog = seed_profiles()
+    app = profile_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        feed = app.screen.query_one(FeedWidget)
+        running_config = SDRConfig(111111111, 8, 3, 4)
+        feed.sdr_session = SimpleNamespace(state='running', config=running_config)
+        feed._show_sdr_state('running', None)  # noqa: SLF001
+        status = str(app.screen.query_one('#sdr-profile-status', Label).render())
+        assert 'Next Start' in status
+        assert str(catalog.selected.config.frequency_hz) in status
+        assert 'Port 8888: running' in status
+        assert str(running_config.frequency_hz) in status
+        assert 'Device 3' in status
+        assert feed.sdr_session.config == running_config
+
+
+@pytest.mark.asyncio
+async def test_profile_name_input_accepts_plain_p(profile_app):
+    app = profile_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press('p')
+        await pilot.pause()
+        await pilot.click(app.screen.query_one('#profile-new', Button))
+        await pilot.pause()
+        name = app.screen.query_one('#profile-name', Input)
+        name.focus()
+        await pilot.press('p')
+        await pilot.pause()
+        assert name.value == 'p'
+
+
+@pytest.mark.asyncio
 async def test_profile_web_boundary_uses_active_driver_and_never_loads_store(profile_app, monkeypatch):
     seed_profiles()
     monkeypatch.setattr(HeadlessDriver, 'is_web', property(lambda _driver: True))
@@ -2434,6 +2619,8 @@ async def test_profile_web_boundary_uses_active_driver_and_never_loads_store(pro
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app.sdr_config is None
+        status = str(app.screen.query_one('#sdr-profile-status', Label).render())
+        assert 'unavailable in web mode' in status
         await pilot.press('p')
         await pilot.pause()
         assert isinstance(app.screen, MainScreen)
